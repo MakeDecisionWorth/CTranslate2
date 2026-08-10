@@ -270,6 +270,15 @@ set(CUDA_SOURCES
 )
 # Compiled by the DPC++ compiler with -fsycl. Only the files that actually contain
 # device code need the flag, so the CPU sources keep their current build cost.
+# Already in SOURCES, so they must not be listed again below, but they include
+# xpu/utils.h and so need the SYCL headers - which the compiler only puts on the include
+# path when -fsycl is given. The MSVC-mode driver on Windows finds them anyway, which is
+# why the omission was invisible there.
+set(SYCL_HEADER_SOURCES
+  src/devices.cc
+  src/types.cc
+)
+
 set(SYCL_SOURCES
   src/xpu/allocator.cc
   src/xpu/primitives.cc
@@ -883,7 +892,7 @@ elseif(WITH_SYCL)
 
   # -fsycl is needed at compile time only for the translation units holding device
   # code, but at link time for the whole target so the device images are embedded.
-  set_source_files_properties(${SYCL_SOURCES}
+  set_source_files_properties(${SYCL_SOURCES} ${SYCL_HEADER_SOURCES}
     PROPERTIES COMPILE_OPTIONS "${SYCL_COMPILE_OPTIONS}")
 
   add_library(${PROJECT_NAME}
