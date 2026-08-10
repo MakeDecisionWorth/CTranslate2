@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <random>
 #include <thread>
 #include <set>
@@ -844,24 +845,32 @@ TEST(OpDeviceTest, ConcurrentSecondSyclClient) {
   std::atomic<bool> failed{false};
 
   // The other client. Note the context is its own - USM allocated here is invisible to
-  // CTranslate2's, exactly as PyTorch's is.
+  // CTranslate2's, exactly as PyTorch's is. It allocates and frees as it goes rather than
+  // reusing one buffer: PyTorch runs a model here, and it is the memory manager the two
+  // clients share, not just the compute engine.
   std::thread other([&]() {
     try {
       ::sycl::queue queue(xpu::get_devices().front());
-      auto* buffer = ::sycl::malloc_device<float>(1 << 20, queue);
+      std::mt19937 sizes(3);
       while (!stop) {
-        queue.parallel_for(::sycl::range<1>(1 << 20),
-                           [=](::sycl::id<1> i) { buffer[i] = buffer[i] * 1.000001f + 1.f; });
+        const size_t count = (1 << 20) * (1 + sizes() % 16);
+        auto* buffer = ::sycl::malloc_device<float>(count, queue);
+        if (!buffer)
+          continue;
+        for (int i = 0; i < 4; ++i)
+          queue.parallel_for(::sycl::range<1>(count),
+                             [=](::sycl::id<1> j) { buffer[j] = buffer[j] * 1.000001f + 1.f; });
         queue.wait_and_throw();
+        ::sycl::free(buffer, queue);
       }
-      ::sycl::free(buffer, queue);
     } catch (const std::exception&) {
       failed = true;
     }
   });
 
   try {
-    for (int round = 0; round < 60; ++round) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+    for (int round = 0; std::chrono::steady_clock::now() < deadline; ++round) {
       StorageView input({batch_size, depth}, data, device);
       StorageView values(DataType::FLOAT32, device);
       StorageView indices(DataType::INT32, device);
