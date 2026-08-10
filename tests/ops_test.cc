@@ -825,7 +825,8 @@ TEST_P(OpDeviceTest, TopKBeamSearchShape) {
   StorageView input({batch_size, depth}, data, device);
   StorageView values(DataType::FLOAT32, device);
   StorageView indices(DataType::INT32, device);
-  ops::TopK(k)(input, values, indices);
+  ops::TopK op(k);
+  op(input, values, indices);
 
   // Every index has to be in range: an out-of-range one is read back by the beam search
   // as a beam and a token id, and used to gather the cache.
