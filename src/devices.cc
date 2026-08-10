@@ -4,6 +4,9 @@
 #  include "cuda/utils.h"
 #  include "cuda/random.h"
 #endif
+#ifdef CT2_WITH_SYCL
+#  include "xpu/utils.h"
+#endif
 #ifdef CT2_WITH_TENSOR_PARALLEL
 #  include <unistd.h>
 #endif
@@ -19,14 +22,25 @@ namespace ctranslate2 {
 #else
       throw std::invalid_argument("This CTranslate2 package was not compiled with CUDA support");
 #endif
+    if (device == "xpu" || device == "XPU")
+#ifdef CT2_WITH_SYCL
+      return Device::XPU;
+#else
+      throw std::invalid_argument("This CTranslate2 package was not compiled with SYCL support");
+#endif
     if (device == "cpu" || device == "CPU")
       return Device::CPU;
-    if (device == "auto" || device == "AUTO")
+    if (device == "auto" || device == "AUTO") {
 #ifdef CT2_WITH_CUDA
-      return cuda::has_gpu() ? Device::CUDA : Device::CPU;
-#else
-      return Device::CPU;
+      if (cuda::has_gpu())
+        return Device::CUDA;
 #endif
+#ifdef CT2_WITH_SYCL
+      if (xpu::has_gpu())
+        return Device::XPU;
+#endif
+      return Device::CPU;
+    }
     throw std::invalid_argument("unsupported device " + device);
   }
 
@@ -34,6 +48,8 @@ namespace ctranslate2 {
     switch (device) {
     case Device::CUDA:
       return "cuda";
+    case Device::XPU:
+      return "xpu";
     case Device::CPU:
       return "cpu";
     }
@@ -49,6 +65,12 @@ namespace ctranslate2 {
     case Device::CUDA:
 #ifdef CT2_WITH_CUDA
       return cuda::get_gpu_count();
+#else
+      return 0;
+#endif
+    case Device::XPU:
+#ifdef CT2_WITH_SYCL
+      return xpu::get_gpu_count();
 #else
       return 0;
 #endif
@@ -88,6 +110,18 @@ namespace ctranslate2 {
   }
 #endif
 
+#ifdef CT2_WITH_SYCL
+  template<>
+  int get_device_index<Device::XPU>() {
+    return xpu::get_device_index();
+  }
+
+  template<>
+  void set_device_index<Device::XPU>(int index) {
+    xpu::set_device_index(index);
+  }
+#endif
+
   int get_device_index(Device device) {
     int index = 0;
     DEVICE_DISPATCH(device, index = get_device_index<D>());
@@ -103,31 +137,50 @@ namespace ctranslate2 {
     if (device == Device::CUDA) {
       const ScopedDeviceSetter scoped_device_setter(device, index);
       cudaDeviceSynchronize();
+      return;
     }
-#else
+#endif
+#ifdef CT2_WITH_SYCL
+    if (device == Device::XPU) {
+      const ScopedDeviceSetter scoped_device_setter(device, index);
+      xpu::synchronize_device();
+      return;
+    }
+#endif
     (void)device;
     (void)index;
-#endif
   }
 
   void synchronize_stream(Device device) {
 #ifdef CT2_WITH_CUDA
     if (device == Device::CUDA) {
       cudaStreamSynchronize(cuda::get_cuda_stream());
+      return;
     }
-#else
-    (void)device;
 #endif
+#ifdef CT2_WITH_SYCL
+    if (device == Device::XPU) {
+      xpu::synchronize_queue();
+      return;
+    }
+#endif
+    (void)device;
   }
 
   void destroy_context(Device device) {
 #ifdef CT2_WITH_CUDA
-      if (device == Device::CUDA) {
-          cuda::free_curand_states();
-      }
-#else
-      (void)device;
+    if (device == Device::CUDA) {
+      cuda::free_curand_states();
+      return;
+    }
 #endif
+#ifdef CT2_WITH_SYCL
+    if (device == Device::XPU) {
+      xpu::destroy_queue();
+      return;
+    }
+#endif
+    (void)device;
   }
 
   // Initialize the static member variable

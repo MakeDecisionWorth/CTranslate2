@@ -17,6 +17,11 @@ if sys.platform == "win32":
     except (FileNotFoundError, OSError):
         pass
 
+    # The Intel SYCL runtime resolves part of its Unified Runtime loader chain
+    # (ur_win_proxy_loader -> ur_loader -> adapters) through the legacy search order,
+    # which add_dll_directory() does not cover. PATH does.
+    os.environ["PATH"] = package_dir + os.pathsep + os.environ.get("PATH", "")
+
     for library in glob.glob(os.path.join(package_dir, "*.dll")):
         ctypes.CDLL(library)
 

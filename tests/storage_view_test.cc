@@ -88,3 +88,6 @@ INSTANTIATE_TEST_SUITE_P(CPU, StorageViewDeviceTest, ::testing::Values(Device::C
 #ifdef CT2_WITH_CUDA
 INSTANTIATE_TEST_SUITE_P(CUDA, StorageViewDeviceTest, ::testing::Values(Device::CUDA));
 #endif
+#ifdef CT2_WITH_SYCL
+INSTANTIATE_TEST_SUITE_P(XPU, StorageViewDeviceTest, ::testing::Values(Device::XPU));
+#endif

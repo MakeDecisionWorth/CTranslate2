@@ -109,6 +109,7 @@ namespace ctranslate2 {
       py::enum_<Device>(m, "Device")
         .value("cpu", Device::CPU)
         .value("cuda", Device::CUDA)
+        .value("xpu", Device::XPU)
         ;
 
       py::class_<StorageView>(
@@ -170,12 +171,13 @@ namespace ctranslate2 {
                                [](const StorageView& view) {
                                  return device_to_str(view.device());
                                },
-                               "Device where the storage is allocated (\"cpu\" or \"cuda\").")
+                               "Device where the storage is allocated (\"cpu\", \"cuda\" or \"xpu\").")
 
         .def_property_readonly("__array_interface__", [](const StorageView& view) {
-          if (view.device() == Device::CUDA)
+          if (view.device() != Device::CPU)
             throw py::attribute_error("Cannot get __array_interface__ when the StorageView "
-                                      "is viewing a CUDA array");
+                                      "is viewing a " + device_to_str(view.device())
+                                      + " array");
           return get_array_interface(view);
         })
 

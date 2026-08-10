@@ -115,6 +115,8 @@ The following options can be set with `-DOPTION=VALUE` during the CMake configur
 | WITH_OPENBLAS | **OFF**, ON | Compiles with the OpenBLAS backend |
 | WITH_RUY | **OFF**, ON | Compiles with the Ruy backend |
 | WITH_HIP | **OFF**, ON | Compiles with the AMD HIP GPU backend |
+| WITH_SYCL | **OFF**, ON | Compiles with the Intel SYCL GPU backend (requires the oneAPI DPC++ compiler) |
+| SYCL_AOT_TARGET | *empty*, *device name* | Compiles the SYCL kernels ahead of time for the given device (for example `dg2` for Arc Alchemist). Empty means the kernels are JIT compiled on first use |
 
 Some build options require additional dependencies. See their respective documentation for installation instructions.
 
@@ -125,6 +127,7 @@ Some build options require additional dependencies. See their respective documen
 * `-DWITH_ACCELERATE=ON` requires [Accelerate](https://developer.apple.com/documentation/accelerate)
 * `-DWITH_OPENBLAS=ON` requires [OpenBLAS](https://github.com/xianyi/OpenBLAS)
 * `-DWITH_HIP=ON` requires [ROCm libraries](https://rocm.docs.amd.com/en/latest/reference/api-libraries.html)
+* `-DWITH_SYCL=ON` requires the [Intel oneAPI DPC++/C++ compiler](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler.html) and must be configured with `-DCMAKE_CXX_COMPILER=icx`
 
 Multiple backends can be enabled for a single build, for example:
 

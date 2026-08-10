@@ -1,12 +1,17 @@
 *.pyc
 /.vs
 /build
+/install
+/install-*
 
 CMake*.json
 .idea
 python/build/
 python/ctranslate2.egg-info/
 python/dist/
+# Runtime libraries staged into the wheel by the build scripts.
+python/ctranslate2/*.dll
+python/README.md
 .cache
 docs/build/
 docs/python/

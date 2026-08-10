@@ -410,15 +410,24 @@ namespace ctranslate2 {
     if (size != _size)
       THROW_INVALID_ARGUMENT("buffer to copy is of size " + std::to_string(size)
                              + " but current storage size is " + std::to_string(_size));
-#ifdef CT2_WITH_CUDA
     if (device != _device) {
+#ifdef CT2_WITH_CUDA
       if (device == Device::CUDA)
         cross_device_primitives<Device::CUDA, Device::CPU>::copy(data, this->data<T>(), size);
-      else
+      else if (_device == Device::CUDA)
         cross_device_primitives<Device::CPU, Device::CUDA>::copy(data, this->data<T>(), size);
-    } else
+      else
 #endif
-    {
+#ifdef CT2_WITH_SYCL
+      if (device == Device::XPU)
+        cross_device_primitives<Device::XPU, Device::CPU>::copy(data, this->data<T>(), size);
+      else if (_device == Device::XPU)
+        cross_device_primitives<Device::CPU, Device::XPU>::copy(data, this->data<T>(), size);
+      else
+#endif
+        THROW_RUNTIME_ERROR("Cannot copy from device " + device_to_str(device)
+                            + " to device " + device_to_str(_device));
+    } else {
       DEVICE_DISPATCH(device, primitives<D>::copy(data, this->data<T>(), size));
     }
 

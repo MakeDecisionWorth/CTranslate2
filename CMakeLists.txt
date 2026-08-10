@@ -15,6 +15,12 @@ option(WITH_RUY "Compile with Ruy backend" OFF)
 option(WITH_CUDA "Compile with CUDA backend" OFF)
 option(WITH_CUDNN "Compile with cuDNN backend" OFF)
 option(WITH_HIP "Compile with AMD HIP GPU backend" OFF)
+option(WITH_SYCL "Compile with Intel SYCL GPU backend" OFF)
+# Empty means JIT: kernels are compiled on first use, which costs several seconds per
+# kernel and is very visible on a model with many distinct kernels. Set to a device
+# name understood by ocloc (for example "dg2" for Arc Alchemist, or a comma separated
+# list) to compile them ahead of time instead.
+set(SYCL_AOT_TARGET "" CACHE STRING "Device to compile SYCL kernels for ahead of time")
 option(CUDA_DYNAMIC_LOADING "Dynamically load CUDA libraries at runtime" OFF)
 option(ENABLE_CPU_DISPATCH "Compile CPU kernels for multiple ISA and dispatch at runtime" ON)
 option(ENABLE_PROFILING "Compile with profiling support" OFF)
@@ -85,7 +91,12 @@ string(REPLACE "." ";" CTRANSLATE2_VERSION_LIST ${CTRANSLATE2_VERSION})
 list(GET CTRANSLATE2_VERSION_LIST 0 CTRANSLATE2_MAJOR_VERSION)
 
 if(MSVC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /d2FH4-")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    # MSVC-only codegen workaround. icx rejects it as an unused argument, which is
+    # fatal in subprojects that build with -Werror (googletest).
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /d2FH4-")
+  endif()
 else()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 endif()
@@ -256,6 +267,36 @@ set(CUDA_SOURCES
   src/ops/awq/gemv_gpu.cu
   src/ops/awq/dequantize_gpu.cu
 )
+# Compiled by the DPC++ compiler with -fsycl. Only the files that actually contain
+# device code need the flag, so the CPU sources keep their current build cost.
+set(SYCL_SOURCES
+  src/xpu/allocator.cc
+  src/xpu/primitives.cc
+  src/xpu/utils.cc
+  src/ops/alibi_add_xpu.cc
+  src/ops/bias_add_xpu.cc
+  src/ops/concat_split_slide_xpu.cc
+  src/ops/conv1d_xpu.cc
+  src/ops/dequantize_xpu.cc
+  src/ops/flash_attention_xpu.cc
+  src/ops/gather_xpu.cc
+  src/ops/gumbel_max_xpu.cc
+  src/ops/layer_norm_xpu.cc
+  src/ops/mean_xpu.cc
+  src/ops/median_filter_xpu.cc
+  src/ops/multinomial_xpu.cc
+  src/ops/nccl_ops_xpu.cc
+  src/ops/quantize_xpu.cc
+  src/ops/rms_norm_xpu.cc
+  src/ops/rotary_xpu.cc
+  src/ops/softmax_xpu.cc
+  src/ops/tile_xpu.cc
+  src/ops/topk_xpu.cc
+  src/ops/topp_mask_xpu.cc
+  src/ops/awq/gemm_xpu.cc
+  src/ops/awq/gemv_xpu.cc
+  src/ops/awq/dequantize_xpu.cc
+)
 set(LIBRARIES
   ${CMAKE_THREAD_LIBS_INIT}
   spdlog::spdlog_header_only
@@ -310,7 +351,13 @@ if(ENABLE_CPU_DISPATCH)
 endif()
 
 if(NOT OPENMP_RUNTIME STREQUAL "NONE")
-  if(MSVC)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    # CMake reports MSVC=TRUE for IntelLLVM, but /openmp would select the
+    # Microsoft-compatible runtime (vcomp). That would coexist with the Intel OpenMP
+    # runtime MKL links against, and two OpenMP runtimes in one process crash.
+    # /Qiopenmp binds to libiomp5 instead.
+    add_compile_options("/Qiopenmp")
+  elseif(MSVC)
     add_compile_options("/openmp")
   else()
     find_package(OpenMP)
@@ -378,7 +425,16 @@ if(WITH_MKL)
   endif()
 
   add_definitions(-DCT2_WITH_MKL -DMKL_ILP64)
-  if(WIN32)
+  if(WIN32 AND WITH_SYCL)
+    # oneMKL only ships the SYCL BLAS as an import library, so the whole MKL link has
+    # to be dynamic - a static CPU MKL next to a dynamic SYCL MKL would put two copies
+    # of the runtime in one process.
+    set(MKL_LIBRARIES
+      ${MKL_LIBRARY_DIR}/mkl_core_dll.lib
+      ${MKL_LIBRARY_DIR}/mkl_intel_ilp64_dll.lib
+      ${MKL_LIBRARY_DIR}/mkl_sycl_blas_dll.lib
+      )
+  elseif(WIN32)
     set(MKL_LIBRARIES
       ${MKL_LIBRARY_DIR}/mkl_core.lib
       ${MKL_LIBRARY_DIR}/mkl_intel_ilp64.lib
@@ -392,7 +448,9 @@ if(WITH_MKL)
   endif()
 
   if(OPENMP_RUNTIME STREQUAL "INTEL")
-    if(WIN32)
+    if(WIN32 AND WITH_SYCL)
+      list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/mkl_intel_thread_dll.lib)
+    elseif(WIN32)
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/mkl_intel_thread.lib)
     else()
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/libmkl_intel_thread.a)
@@ -494,6 +552,9 @@ ENDIF ()
 if (WITH_CUDA)
   if(WITH_HIP)
     message(FATAL_ERROR "WITH_CUDA=ON incompatible with WITH_HIP=ON")
+  endif()
+  if(WITH_SYCL)
+    message(FATAL_ERROR "WITH_CUDA=ON incompatible with WITH_SYCL=ON")
   endif()
   find_package(CUDA 11.0 REQUIRED)
   list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
@@ -771,6 +832,43 @@ elseif(WITH_HIP)
 
   set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
+
+elseif(WITH_SYCL)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    message(FATAL_ERROR "WITH_SYCL=ON requires the Intel oneAPI DPC++ compiler "
+                        "(set -DCMAKE_CXX_COMPILER=icx), but the compiler is "
+                        "${CMAKE_CXX_COMPILER_ID}")
+  endif()
+  if(WITH_TENSOR_PARALLEL)
+    message(FATAL_ERROR "WITH_SYCL=ON incompatible with WITH_TENSOR_PARALLEL=ON")
+  endif()
+  if(WITH_FLASH_ATTN)
+    message(FATAL_ERROR "WITH_SYCL=ON incompatible with WITH_FLASH_ATTN=ON")
+  endif()
+
+  add_definitions(-DCT2_WITH_SYCL)
+
+  set(SYCL_COMPILE_OPTIONS "-fsycl")
+  set(SYCL_LINK_OPTIONS "-fsycl")
+  if(SYCL_AOT_TARGET)
+    message(STATUS "Compiling SYCL kernels ahead of time for: ${SYCL_AOT_TARGET}")
+    list(APPEND SYCL_COMPILE_OPTIONS "-fsycl-targets=spir64_gen")
+    # The device name only matters at link time, when the device images are produced.
+    list(APPEND SYCL_LINK_OPTIONS "-fsycl-targets=spir64_gen"
+                                  "-Xs" "-device ${SYCL_AOT_TARGET}")
+  endif()
+
+  # -fsycl is needed at compile time only for the translation units holding device
+  # code, but at link time for the whole target so the device images are embedded.
+  set_source_files_properties(${SYCL_SOURCES}
+    PROPERTIES COMPILE_OPTIONS "${SYCL_COMPILE_OPTIONS}")
+
+  add_library(${PROJECT_NAME}
+    ${SOURCES}
+    ${SYCL_SOURCES}
+  )
+
+  target_link_options(${PROJECT_NAME} PRIVATE ${SYCL_LINK_OPTIONS})
 
 elseif(WITH_CUDNN)
   message(FATAL_ERROR "WITH_CUDNN=ON requires WITH_CUDA=ON")

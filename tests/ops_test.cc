@@ -527,6 +527,87 @@ static const StorageView gemm_y({4, 2}, std::vector<float>{
     0.399763, 0.328475, 0.448811, 0.777195,
     -0.327203, 0.279757, -0.434141, -0.743254});
 
+// MatMul had no coverage at all, which is how a broken batched GEMM reached the
+// Whisper encoder unnoticed. Exercise both the single and the batched path.
+TEST_P(OpDeviceFPTest, MatMulBatch) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+  const float error = GetParam().error;
+  // 2 batches of a 2x3 by 3x2 product.
+  StorageView a({2, 2, 3}, std::vector<float>{1, 2, 3, 4, 5, 6,
+                                              1, 0, 1, 0, 1, 0});
+  StorageView b({2, 3, 2}, std::vector<float>{1, 2, 3, 4, 5, 6,
+                                              1, 1, 1, 1, 1, 1});
+  StorageView expected({2, 2, 2}, std::vector<float>{22, 28, 49, 64,
+                                                     2, 2, 1, 1});
+  StorageView c(dtype, device);
+  ops::MatMul()(a.to(device).to(dtype), b.to(device).to(dtype), c);
+  EXPECT_EQ(c.dtype(), dtype);
+  expect_storage_eq(c.to_float32().to(Device::CPU), expected, error);
+}
+
+TEST_P(OpDeviceFPTest, MatMulBatchTransposeB) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+  const float error = GetParam().error;
+  StorageView a({2, 2, 3}, std::vector<float>{1, 2, 3, 4, 5, 6,
+                                              1, 0, 1, 0, 1, 0});
+  StorageView b({2, 2, 3}, std::vector<float>{1, 3, 5, 2, 4, 6,
+                                              1, 1, 1, 1, 1, 1});
+  StorageView expected({2, 2, 2}, std::vector<float>{22, 28, 49, 64,
+                                                     2, 2, 1, 1});
+  StorageView c(dtype, device);
+  ops::MatMul(false, true)(a.to(device).to(dtype), b.to(device).to(dtype), c);
+  EXPECT_EQ(c.dtype(), dtype);
+  expect_storage_eq(c.to_float32().to(Device::CPU), expected, error);
+}
+
+// Encoder-shaped (but small) attention sequence. The per-op tests all use tiny
+// tensors, so nothing exercised a row wider than one work-group or a batched matmul
+// with attention's aspect ratio.
+TEST_P(OpDeviceFPTest, SoftMaxWideRow) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+  const float error = GetParam().error;
+  const dim_t rows = 3;
+  const dim_t depth = 1024;  // several times the work-group size
+  std::vector<float> data(rows * depth);
+  for (dim_t i = 0; i < rows * depth; ++i)
+    data[i] = static_cast<float>((i % 17)) * 0.1f - 0.8f;
+  StorageView x({rows, depth}, data);
+
+  StorageView expected_cpu(DataType::FLOAT32, Device::CPU);
+  ops::SoftMax()(x, expected_cpu);
+
+  StorageView y(dtype, device);
+  ops::SoftMax()(x.to(device).to(dtype), y);
+  expect_storage_eq(y.to_float32().to(Device::CPU), expected_cpu, error);
+}
+
+TEST_P(OpDeviceFPTest, MatMulAttentionShape) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+  const float error = GetParam().error;
+  const dim_t heads = 4;
+  const dim_t length = 96;
+  const dim_t depth = 32;
+  std::vector<float> qa(heads * length * depth);
+  std::vector<float> ka(heads * length * depth);
+  for (size_t i = 0; i < qa.size(); ++i) {
+    qa[i] = static_cast<float>((i % 13)) * 0.05f - 0.3f;
+    ka[i] = static_cast<float>((i % 7)) * 0.08f - 0.2f;
+  }
+  StorageView q({heads, length, depth}, qa);
+  StorageView k({heads, length, depth}, ka);
+
+  StorageView expected_cpu(DataType::FLOAT32, Device::CPU);
+  ops::MatMul(false, true)(q, k, expected_cpu);
+
+  StorageView out(dtype, device);
+  ops::MatMul(false, true)(q.to(device).to(dtype), k.to(device).to(dtype), out);
+  expect_storage_eq(out.to_float32().to(Device::CPU), expected_cpu, error);
+}
+
 TEST_P(OpDeviceFPTest, Gemm) {
   const Device device = GetParam().device;
   const DataType dtype = GetParam().dtype;
@@ -1441,5 +1522,14 @@ INSTANTIATE_TEST_SUITE_P(CUDA, OpDeviceFPTest,
                          ::testing::Values(FloatType{Device::CUDA, DataType::FLOAT32, 1e-5},
                                            FloatType{Device::CUDA, DataType::FLOAT16, 1e-2},
                                            FloatType{Device::CUDA, DataType::BFLOAT16, 4e-2}),
+                         fp_test_name);
+#endif
+#ifdef CT2_WITH_SYCL
+INSTANTIATE_TEST_SUITE_P(XPU, OpDeviceTest, ::testing::Values(Device::XPU));
+// BFLOAT16 is left out: Alchemist has no native bf16 math and mayiuse_bfloat16()
+// reports it unsupported, so there are no kernels behind it yet.
+INSTANTIATE_TEST_SUITE_P(XPU, OpDeviceFPTest,
+                         ::testing::Values(FloatType{Device::XPU, DataType::FLOAT32, 1e-5},
+                                           FloatType{Device::XPU, DataType::FLOAT16, 1e-2}),
                          fp_test_name);
 #endif
