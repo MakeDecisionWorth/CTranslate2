@@ -941,9 +941,12 @@ TEST_P(OpDeviceTest, ConcurrentSubmission) {
 
 TEST_P(OpDeviceTest, TopKBeamSearchShape) {
   Device device = GetParam();
-  const dim_t batch_size = 24;
-  const dim_t depth = 259325;  // 5 beams * 51865 vocabulary entries
-  const dim_t k = 10;          // 2 * beam_size
+  // The shape at the boundary where a real decode starts faulting: beam_size 3 finishes
+  // and 4 does not. batch_size is 1 because faster-whisper's plain transcribe() decodes
+  // one segment at a time - the batched pipeline was masking which shape mattered.
+  const dim_t batch_size = 1;
+  const dim_t depth = 207460;  // 4 beams * 51865 vocabulary entries
+  const dim_t k = 8;           // 2 * beam_size
 
   std::vector<float> data(batch_size * depth);
   std::mt19937 gen(42);
