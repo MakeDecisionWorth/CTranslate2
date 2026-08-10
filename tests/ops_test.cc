@@ -6,6 +6,9 @@
 #include "test_utils.h"
 #include "ctranslate2/layers/attention.h"
 #include "ctranslate2/ops/ops.h"
+#ifdef CT2_WITH_SYCL
+#  include "xpu/utils.h"
+#endif
 
 TEST(OpTest, Transpose1D) {
   StorageView x({4}, std::vector<float>{1, 2, 3, 4});
@@ -817,6 +820,70 @@ TEST_P(OpDeviceFPTest, TopK) {
 // tensors, and in the whisperx process PyTorch is on the same device as well. The
 // GPU fault that beam search hits only ever appeared with two SYCL clients in flight,
 // so this is here to say whether CTranslate2 can produce it on its own.
+#ifdef CT2_WITH_SYCL
+// A second SYCL client on the same device, which is what PyTorch is in the whisperx
+// process: its own context and its own queue, submitting while CTranslate2 does. That
+// is the one ingredient present in every run that faulted and absent from every run
+// that did not, so this reproduces it without needing PyTorch.
+TEST(OpDeviceTest, ConcurrentSecondSyclClient) {
+  if (!xpu::has_gpu())
+    GTEST_SKIP() << "no XPU device";
+
+  const Device device = Device::XPU;
+  const dim_t batch_size = 24;
+  const dim_t depth = 259325;
+  const dim_t k = 10;
+
+  std::vector<float> data(batch_size * depth);
+  std::mt19937 gen(11);
+  std::uniform_real_distribution<float> dist(-20.f, 0.f);
+  for (auto& value : data)
+    value = dist(gen);
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> failed{false};
+
+  // The other client. Note the context is its own - USM allocated here is invisible to
+  // CTranslate2's, exactly as PyTorch's is.
+  std::thread other([&]() {
+    try {
+      ::sycl::queue queue(xpu::get_devices().front());
+      auto* buffer = ::sycl::malloc_device<float>(1 << 20, queue);
+      while (!stop) {
+        queue.parallel_for(::sycl::range<1>(1 << 20),
+                           [=](::sycl::id<1> i) { buffer[i] = buffer[i] * 1.000001f + 1.f; });
+        queue.wait_and_throw();
+      }
+      ::sycl::free(buffer, queue);
+    } catch (const std::exception&) {
+      failed = true;
+    }
+  });
+
+  try {
+    for (int round = 0; round < 60; ++round) {
+      StorageView input({batch_size, depth}, data, device);
+      StorageView values(DataType::FLOAT32, device);
+      StorageView indices(DataType::INT32, device);
+      ops::TopK op(k);
+      op(input, values, indices);
+      const StorageView host = indices.to(Device::CPU);
+      for (dim_t i = 0; i < host.size(); ++i) {
+        const int32_t index = host.data<int32_t>()[i];
+        if (index < 0 || index >= depth)
+          failed = true;
+      }
+    }
+  } catch (const std::exception&) {
+    failed = true;
+  }
+
+  stop = true;
+  other.join();
+  EXPECT_FALSE(failed);
+}
+#endif
+
 TEST_P(OpDeviceTest, ConcurrentSubmission) {
   Device device = GetParam();
   const dim_t batch_size = 24;
