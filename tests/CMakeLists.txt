@@ -54,3 +54,10 @@ elseif(WITH_HIP)
   target_link_libraries(benchmark_ops PRIVATE hiprand roc::hipblas roc::rocprim roc::rocthrust hip::hipcub)
 
 endif()
+
+if(WITH_SYCL)
+  # ops_test.cc includes xpu/utils.h for the concurrency tests, and the SYCL headers are
+  # only on the include path when -fsycl is given.
+  set_source_files_properties(ops_test.cc PROPERTIES COMPILE_OPTIONS "${SYCL_COMPILE_OPTIONS}")
+  target_link_options(ctranslate2_test PRIVATE ${SYCL_LINK_OPTIONS})
+endif()
