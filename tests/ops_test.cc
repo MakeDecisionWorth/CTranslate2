@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <atomic>
 #include <random>
+#include <thread>
 #include <set>
 #include "test_utils.h"
 #include "ctranslate2/layers/attention.h"
@@ -810,6 +812,57 @@ TEST_P(OpDeviceFPTest, TopK) {
 // beam and the vocabulary flattened into the depth, and k = 2 * beam_size. It is three
 // orders of magnitude wider than the other TopK tests, which is what stopped them from
 // covering the beam search path at all.
+// Two threads driving one device, which is what a Whisper decode looks like from the
+// outside: CTranslate2 runs the model on a worker while the caller keeps handing it
+// tensors, and in the whisperx process PyTorch is on the same device as well. The
+// GPU fault that beam search hits only ever appeared with two SYCL clients in flight,
+// so this is here to say whether CTranslate2 can produce it on its own.
+TEST_P(OpDeviceTest, ConcurrentSubmission) {
+  Device device = GetParam();
+  const dim_t batch_size = 24;
+  const dim_t depth = 259325;
+  const dim_t k = 10;
+
+  std::vector<float> data(batch_size * depth);
+  std::mt19937 gen(7);
+  std::uniform_real_distribution<float> dist(-20.f, 0.f);
+  for (auto& value : data)
+    value = dist(gen);
+
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 2; ++t) {
+    threads.emplace_back([&]() {
+      try {
+        for (int round = 0; round < 40; ++round) {
+          StorageView input({batch_size, depth}, data, device);
+          StorageView values(DataType::FLOAT32, device);
+          StorageView indices(DataType::INT32, device);
+          ops::TopK op(k);
+          op(input, values, indices);
+
+          // The beam reorder that consumes those indices.
+          StorageView gathered(DataType::FLOAT32, device);
+          StorageView beams({batch_size}, std::vector<int32_t>(batch_size, 0), device);
+          ops::Gather()(input, beams, gathered);
+
+          const StorageView host = indices.to(Device::CPU);
+          for (dim_t i = 0; i < host.size(); ++i) {
+            const int32_t index = host.data<int32_t>()[i];
+            if (index < 0 || index >= depth)
+              failed = true;
+          }
+        }
+      } catch (const std::exception&) {
+        failed = true;
+      }
+    });
+  }
+  for (auto& thread : threads)
+    thread.join();
+  EXPECT_FALSE(failed);
+}
+
 TEST_P(OpDeviceTest, TopKBeamSearchShape) {
   Device device = GetParam();
   const dim_t batch_size = 24;
