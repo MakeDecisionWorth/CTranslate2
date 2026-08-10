@@ -5,6 +5,7 @@
 #include <mutex>
 
 #include <algorithm>
+#include <string>
 
 #include <spdlog/spdlog.h>
 
@@ -16,6 +17,14 @@ namespace ctranslate2 {
     static std::vector<::sycl::device> discover_devices() {
       std::vector<::sycl::device> devices;
 
+      // Set CT2_XPU_DEVICE_TYPE=cpu to run the SYCL kernels on the OpenCL CPU device.
+      // That is not a configuration to deploy - it exists so the kernels can be run
+      // under a sanitizer or a debugger on hosts where the GPU path cannot be, and it
+      // checks the index arithmetic against the same inputs.
+      const std::string device_type = read_string_from_env("CT2_XPU_DEVICE_TYPE", "gpu");
+      const auto wanted = (device_type == "cpu" ? ::sycl::info::device_type::cpu
+                           : ::sycl::info::device_type::gpu);
+
       // Prefer a single backend so device indices stay stable and each physical GPU
       // is listed once. Level Zero first, to match PyTorch's XPU device numbering.
       for (const auto backend : {::sycl::backend::ext_oneapi_level_zero,
@@ -23,7 +32,7 @@ namespace ctranslate2 {
         for (const auto& platform : ::sycl::platform::get_platforms()) {
           if (platform.get_backend() != backend)
             continue;
-          for (const auto& device : platform.get_devices(::sycl::info::device_type::gpu))
+          for (const auto& device : platform.get_devices(wanted))
             devices.emplace_back(device);
         }
         if (!devices.empty())
