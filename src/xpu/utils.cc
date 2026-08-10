@@ -4,7 +4,11 @@
 #include <memory>
 #include <mutex>
 
+#include <algorithm>
+
 #include <spdlog/spdlog.h>
+
+#include "env.h"
 
 namespace ctranslate2 {
   namespace xpu {
@@ -92,15 +96,33 @@ namespace ctranslate2 {
       return it->second;
     }
 
-    // One queue per (thread, device), all sharing the device context above. Queues are
-    // kept alive for the process lifetime unless destroy_queue() is called, mirroring
-    // how the CUDA backend caches its stream.
+    // One queue per device, shared by every thread, like the context above. A queue per
+    // thread looks like the CUDA backend's per-thread stream, but it silently breaks the
+    // caching allocator: that allocator hands a freed block straight back out and relies
+    // on the queue being in-order to guarantee the next write to it is enqueued behind
+    // the read that is still pending. Two queues are not ordered against each other, so
+    // with a queue per thread a block freed on one thread could be written - or, once the
+    // cache went over budget and was drained, unmapped - while another thread's kernel
+    // was still reading it. The driver reports that as GEN12_OCL_PAGEFAULT.
+    //
+    // Sharing one queue serializes the threads working on a device, which costs nothing
+    // for a single model replica and is the price of the allocator's invariant holding.
+    // Queues are kept alive for the process lifetime unless destroy_queue() is called.
+    static std::mutex& queue_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
     static std::map<int, std::unique_ptr<::sycl::queue>>& queue_cache() {
-      static thread_local std::map<int, std::unique_ptr<::sycl::queue>> cache;
+      static std::map<int, std::unique_ptr<::sycl::queue>> cache;
       return cache;
     }
 
     ::sycl::queue& get_queue() {
+      // Held for the lookup as well as the creation. get_queue() is called once per
+      // kernel launch, where an uncontended mutex costs orders of magnitude less than
+      // the enqueue that follows it.
+      const std::lock_guard<std::mutex> lock(queue_mutex());
       auto& cache = queue_cache();
       const int index = current_device_index;
       auto it = cache.find(index);
@@ -131,6 +153,27 @@ namespace ctranslate2 {
       return *it->second;
     }
 
+    bool sync_after_launch() {
+      static const bool sync = read_bool_from_env("CT2_XPU_SYNC", false);
+      return sync;
+    }
+
+    bool check_bounds() {
+      static const bool check = read_bool_from_env("CT2_XPU_CHECK_BOUNDS", false);
+      return check;
+    }
+
+    int32_t* bounds_report() {
+      static int32_t* report = [] {
+        auto& queue = get_queue();
+        auto* buffer = ::sycl::malloc_shared<int32_t>(4, queue);
+        if (buffer)
+          std::fill(buffer, buffer + 4, 0);
+        return buffer;
+      }();
+      return report;
+    }
+
     void synchronize_device() {
       SYCL_CHECK(get_queue().wait_and_throw());
     }
@@ -139,7 +182,12 @@ namespace ctranslate2 {
       SYCL_CHECK(get_queue().wait_and_throw());
     }
 
+    // Teardown only: the queues are shared now, so this invalidates references other
+    // threads may still be holding. Callers have to have stopped using the device.
     void destroy_queue() {
+      const std::lock_guard<std::mutex> lock(queue_mutex());
+      for (auto& entry : queue_cache())
+        entry.second->wait_and_throw();
       queue_cache().clear();
     }
 

@@ -1,5 +1,7 @@
 #include "ctranslate2/ops/gather.h"
 
+#include <spdlog/spdlog.h>
+
 #include "type_dispatch.h"
 #include "xpu/helpers.h"
 
@@ -35,6 +37,8 @@ namespace ctranslate2 {
       const auto width = static_cast<size_t>(copy_size);
       const auto batch_span = static_cast<size_t>(batch_stride);
       const auto per_batch = static_cast<size_t>(num_indices_per_batch);
+      const auto limit = static_cast<size_t>(data.dim(axis));
+      int32_t* report = xpu::check_bounds() ? xpu::bounds_report() : nullptr;
 
       SYCL_CHECK(xpu::get_queue().parallel_for(
                    ::sycl::range<1>(static_cast<size_t>(num_indices * copy_size)),
@@ -44,8 +48,22 @@ namespace ctranslate2 {
                      const size_t offset = flat % width; // position inside the slice
                      const size_t batch_index = i / per_batch;
                      const size_t read_index = static_cast<size_t>(indices[i]);
+                     if (report && read_index >= limit) {
+                       ::sycl::atomic_ref<int32_t,
+                                          ::sycl::memory_order::relaxed,
+                                          ::sycl::memory_scope::device,
+                                          ::sycl::access::address_space::global_space>
+                         count(report[0]);
+                       count.fetch_add(1);
+                       report[1] = indices[i];
+                       report[2] = static_cast<int32_t>(limit);
+                       return;  // Skipping beats faulting the GPU.
+                     }
                      dst[flat] = src[batch_index * batch_span + read_index * width + offset];
                    }));
+      if (report && report[0] != 0)
+        spdlog::error("Gather read {} out-of-range indices, last was {} against a bound of {}",
+                      report[0], report[1], report[2]);
     }
 
 #define DECLARE_IMPL(T)                                                 \

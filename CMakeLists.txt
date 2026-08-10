@@ -21,6 +21,7 @@ option(WITH_SYCL "Compile with Intel SYCL GPU backend" OFF)
 # name understood by ocloc (for example "dg2" for Arc Alchemist, or a comma separated
 # list) to compile them ahead of time instead.
 set(SYCL_AOT_TARGET "" CACHE STRING "Device to compile SYCL kernels for ahead of time")
+option(SYCL_SANITIZE "Instrument SYCL device code with AddressSanitizer" OFF)
 option(CUDA_DYNAMIC_LOADING "Dynamically load CUDA libraries at runtime" OFF)
 option(ENABLE_CPU_DISPATCH "Compile CPU kernels for multiple ISA and dispatch at runtime" ON)
 option(ENABLE_PROFILING "Compile with profiling support" OFF)
@@ -856,6 +857,25 @@ elseif(WITH_SYCL)
     # The device name only matters at link time, when the device images are produced.
     list(APPEND SYCL_LINK_OPTIONS "-fsycl-targets=spir64_gen"
                                   "-Xs" "-device ${SYCL_AOT_TARGET}")
+  endif()
+  if(SYCL_SANITIZE)
+    message(STATUS "Enabling the SYCL device AddressSanitizer")
+    # -Xarch_device keeps the sanitizer out of the host compilation. Instrumenting the
+    # host too would pull the ASan runtime into whatever process loads this library,
+    # which is a Python interpreter here.
+    list(APPEND SYCL_COMPILE_OPTIONS "-Xarch_device" "-fsanitize=address")
+    list(APPEND SYCL_LINK_OPTIONS "-Xarch_device" "-fsanitize=address")
+    # Only device code is instrumented, so the host sanitizer runtime is not wanted -
+    # and on Windows linking it is an error anyway, because its malloc/free interceptors
+    # collide with the UCRT's.
+    list(APPEND SYCL_LINK_OPTIONS "-fno-sanitize-link-runtime")
+    if(MSVC)
+      # icx still defines __SANITIZE_ADDRESS__ for the host pass of those translation
+      # units, which switches on the MSVC STL's container annotations there and only
+      # there - the mismatch is a link error. Turn them off everywhere so the whole
+      # target agrees.
+      add_definitions(-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION)
+    endif()
   endif()
 
   # -fsycl is needed at compile time only for the translation units holding device

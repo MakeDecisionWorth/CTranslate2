@@ -49,6 +49,12 @@ namespace ctranslate2 {
 
       SYCL_CHECK(xpu::get_queue().submit([&](::sycl::handler& handler) {
         ::sycl::local_accessor<uint32_t, 1> selected(::sycl::range<1>(k), handler);
+        // The reduction is written out by hand rather than with reduce_over_group. The
+        // group algorithm is correct for the float reductions elsewhere, but calling it
+        // on uint64_t once per pass of this loop faulted the GPU intermittently, and an
+        // explicit tree reduction puts every barrier where it can be checked.
+        ::sycl::local_accessor<uint64_t, 1> scratch(
+          ::sycl::range<1>(topk_work_group_size), handler);
 
         handler.parallel_for(
           ::sycl::nd_range<1>(::sycl::range<1>(static_cast<size_t>(batch_size)
@@ -79,8 +85,14 @@ namespace ctranslate2 {
                 local = ::sycl::max(local, candidate);
               }
 
-              const uint64_t best =
-                ::sycl::reduce_over_group(group, local, ::sycl::maximum<uint64_t>());
+              scratch[lid] = local;
+              ::sycl::group_barrier(group);
+              for (size_t stride = topk_work_group_size / 2; stride > 0; stride >>= 1) {
+                if (lid < stride)
+                  scratch[lid] = ::sycl::max(scratch[lid], scratch[lid + stride]);
+                ::sycl::group_barrier(group);
+              }
+              const uint64_t best = scratch[0];
 
               // best == 0 means no work-item found a candidate: k exceeded the number
               // of entries still available in this row. Decoding that would give

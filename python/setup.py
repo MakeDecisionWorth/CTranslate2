@@ -99,6 +99,9 @@ setup(
     },
     keywords="opennmt nmt neural machine translation cuda mkl inference quantization",
     packages=find_packages(exclude=["bin"]),
+    # Top-level helper activated by a ctranslate2_preload.pth in site-packages, so it
+    # runs before torch can register the Intel runtime DLL names. See its docstring.
+    py_modules=["ctranslate2_preload"] if sys.platform == "win32" else [],
     package_data=package_data,
     ext_modules=[ctranslate2_module],
     python_requires=">=3.9",

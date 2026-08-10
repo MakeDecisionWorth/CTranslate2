@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 #include "utils.h"
 
 namespace ctranslate2 {
@@ -16,6 +18,9 @@ namespace ctranslate2 {
     // allocator are stream-ordered, but sycl::free takes effect at once. Keeping freed
     // blocks in a free list turns that into a reuse, and because the queue is in-order
     // any later write to a reused block is enqueued after the earlier read of it.
+    //
+    // That argument needs the device to have exactly one queue - see get_queue() in
+    // xpu/utils.cc, which is why the queue is per device and not per thread.
     class SyclCachingAllocator : public Allocator {
     public:
       void* allocate(size_t size, int device_index) override {
@@ -44,6 +49,8 @@ namespace ctranslate2 {
           // (a different beam size allocates a different KV cache), so it has to be
           // released before giving up. This is the pressure valve the cub caching
           // allocator provides on the CUDA side.
+          spdlog::warn("XPU allocation of {} bytes failed, releasing {} cached bytes",
+                       size, _cached_bytes);
           clear_cache();
           SYCL_CHECK(ptr = ::sycl::malloc_device(size, get_queue()));
         }
@@ -54,6 +61,14 @@ namespace ctranslate2 {
 
         const std::lock_guard<std::mutex> lock(_mutex);
         _allocations[ptr] = {index, size};
+        // What the driver is actually holding, cache included. Level Zero spills past the
+        // card instead of failing, so this is the only place the real footprint is known.
+        _device_bytes += size;
+        if (_device_bytes > _reported_bytes + (size_t(256) << 20)) {
+          _reported_bytes = _device_bytes;
+          spdlog::debug("XPU device memory high-water mark: {} MB ({} MB cached)",
+                        _device_bytes >> 20, _cached_bytes >> 20);
+        }
         return ptr;
       }
 
@@ -74,8 +89,18 @@ namespace ctranslate2 {
         // into shared system memory and everything crawls - so waiting for malloc to
         // return null is not a usable trigger. The cache has to stay under an explicit
         // budget instead.
-        if (over_budget)
-          clear_cache();
+        //
+        // free() runs from StorageView's destructor, so nothing may escape: draining
+        // waits on the queue, and a wait is where an asynchronous device error surfaces.
+        // Letting that propagate out of a destructor calls std::terminate, which on
+        // Windows is a bare 0xC0000409 - the error is destroyed by the reporting of it.
+        if (over_budget) {
+          try {
+            clear_cache();
+          } catch (const std::exception& e) {
+            spdlog::error("Failed to release cached XPU memory: {}", e.what());
+          }
+        }
       }
 
       void clear_cache() override {
@@ -91,6 +116,7 @@ namespace ctranslate2 {
           SYCL_CHECK(queue.wait_and_throw());
           for (void* ptr : entry.second) {
             ::sycl::free(ptr, queue);
+            _device_bytes -= entry.first.second;
             _allocations.erase(ptr);
           }
           entry.second.clear();
@@ -122,6 +148,8 @@ namespace ctranslate2 {
       std::map<Key, std::vector<void*>> _free_blocks;
       std::unordered_map<void*, Key> _allocations;
       size_t _cached_bytes = 0;
+      size_t _device_bytes = 0;
+      size_t _reported_bytes = 0;
     };
 
   }
