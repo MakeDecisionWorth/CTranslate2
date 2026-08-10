@@ -353,11 +353,14 @@ endif()
 
 if(NOT OPENMP_RUNTIME STREQUAL "NONE")
   if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
-    # CMake reports MSVC=TRUE for IntelLLVM, but /openmp would select the
-    # Microsoft-compatible runtime (vcomp). That would coexist with the Intel OpenMP
-    # runtime MKL links against, and two OpenMP runtimes in one process crash.
-    # /Qiopenmp binds to libiomp5 instead.
-    add_compile_options("/Qiopenmp")
+    # Bind to libiomp5, the runtime MKL links against. Two OpenMP runtimes in one
+    # process crash, and on Windows CMake reports MSVC=TRUE for IntelLLVM, so the
+    # branch below would pick /openmp - the Microsoft-compatible runtime, vcomp.
+    if(WIN32)
+      add_compile_options("/Qiopenmp")
+    else()
+      add_compile_options("-fiopenmp")
+    endif()
   elseif(MSVC)
     add_compile_options("/openmp")
   else()
