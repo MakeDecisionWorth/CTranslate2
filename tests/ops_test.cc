@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <random>
+#include <set>
 #include "test_utils.h"
 #include "ctranslate2/layers/attention.h"
 #include "ctranslate2/ops/ops.h"
@@ -802,6 +804,50 @@ TEST_P(OpDeviceFPTest, TopK) {
   op(input.to(dtype), values, indices);
   expect_storage_eq(values.to_float32(), expected_values, error);
   expect_storage_eq(indices, expected_indices);
+}
+
+// The shape a beam-5 Whisper decode actually asks for: one row per batch entry, the
+// beam and the vocabulary flattened into the depth, and k = 2 * beam_size. It is three
+// orders of magnitude wider than the other TopK tests, which is what stopped them from
+// covering the beam search path at all.
+TEST_P(OpDeviceTest, TopKBeamSearchShape) {
+  Device device = GetParam();
+  const dim_t batch_size = 24;
+  const dim_t depth = 259325;  // 5 beams * 51865 vocabulary entries
+  const dim_t k = 10;          // 2 * beam_size
+
+  std::vector<float> data(batch_size * depth);
+  std::mt19937 gen(42);
+  std::uniform_real_distribution<float> dist(-20.f, 0.f);  // log probabilities
+  for (auto& value : data)
+    value = dist(gen);
+
+  StorageView input({batch_size, depth}, data, device);
+  StorageView values(DataType::FLOAT32, device);
+  StorageView indices(DataType::INT32, device);
+  ops::TopK(k)(input, values, indices);
+
+  // Every index has to be in range: an out-of-range one is read back by the beam search
+  // as a beam and a token id, and used to gather the cache.
+  const StorageView host_indices = indices.to(Device::CPU);
+  const StorageView host_values = values.to(Device::CPU);
+  for (dim_t i = 0; i < host_indices.size(); ++i) {
+    const int32_t index = host_indices.data<int32_t>()[i];
+    ASSERT_GE(index, 0) << "at " << i;
+    ASSERT_LT(index, depth) << "at " << i;
+    EXPECT_FLOAT_EQ(host_values.data<float>()[i], data[(i / k) * depth + index]) << "at " << i;
+  }
+
+  // And each row has to come back in descending order, with no index repeated.
+  for (dim_t row = 0; row < batch_size; ++row) {
+    std::set<int32_t> seen;
+    for (dim_t t = 0; t < k; ++t) {
+      const dim_t at = row * k + t;
+      EXPECT_TRUE(seen.insert(host_indices.data<int32_t>()[at]).second) << "row " << row;
+      if (t > 0)
+        EXPECT_LE(host_values.data<float>()[at], host_values.data<float>()[at - 1]);
+    }
+  }
 }
 
 TEST_P(OpDeviceTest, TopKVariableDepth) {
