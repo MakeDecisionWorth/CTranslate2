@@ -452,6 +452,15 @@ if(WITH_MKL)
       ${MKL_LIBRARY_DIR}/mkl_core.lib
       ${MKL_LIBRARY_DIR}/mkl_intel_ilp64.lib
       )
+  elseif(WITH_SYCL)
+    # Same reasoning as the Windows branch above: the SYCL BLAS is shared-only, so the
+    # CPU side has to be shared too rather than mixing in the static archives.
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64")
+    set(MKL_LIBRARIES
+      ${MKL_LIBRARY_DIR}/libmkl_core.so
+      ${MKL_LIBRARY_DIR}/libmkl_intel_ilp64.so
+      ${MKL_LIBRARY_DIR}/libmkl_sycl_blas.so
+      )
   else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64")
     set(MKL_LIBRARIES
@@ -465,6 +474,8 @@ if(WITH_MKL)
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/mkl_intel_thread_dll.lib)
     elseif(WIN32)
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/mkl_intel_thread.lib)
+    elseif(WITH_SYCL)
+      list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/libmkl_intel_thread.so)
     else()
       list(APPEND MKL_LIBRARIES ${MKL_LIBRARY_DIR}/libmkl_intel_thread.a)
     endif()
