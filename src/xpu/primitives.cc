@@ -528,6 +528,22 @@ namespace ctranslate2 {
       return value;
     }
 
+    // The two oneMKL entry points can also be replaced one at a time. They live in the
+    // same library - both resolve to mkl_sycl_blas.6.dll - but not in the same code: a
+    // batched GEMM on this hardware is its own kernel with its own tiling and a much
+    // larger amount of work per submission, so one can be at fault while the other is
+    // fine. Knowing which would allow keeping oneMKL's speed on the healthy path, and
+    // makes a far more precise bug report than "oneMKL's GEMM".
+    static bool tiled_single_enabled() {
+      static const bool value = read_bool_from_env("CT2_XPU_TILED_GEMM_SINGLE", false);
+      return value;
+    }
+
+    static bool tiled_batch_enabled() {
+      static const bool value = read_bool_from_env("CT2_XPU_TILED_GEMM_BATCH", false);
+      return value;
+    }
+
     // One work-item per output element, accumulating in accum_type so the 16-bit types do
     // not lose the sum. Handles the batched case too: a single GEMM is batch_size 1 with
     // zero strides.
@@ -676,7 +692,7 @@ namespace ctranslate2 {
                          const T* b, dim_t ldb,
                          float beta,
                          T* c, dim_t ldc) {
-      if (tiled_gemm_enabled()) {
+      if (tiled_gemm_enabled() || tiled_single_enabled()) {
         tiled_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
                       a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
         return;
@@ -707,7 +723,7 @@ namespace ctranslate2 {
                                        float beta,
                                        T* c, dim_t ldc, dim_t stridec,
                                        dim_t batch_size) {
-      if (tiled_gemm_enabled()) {
+      if (tiled_gemm_enabled() || tiled_batch_enabled()) {
         tiled_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
                       a, lda, stridea, b, ldb, strideb, beta, c, ldc, stridec, batch_size);
         return;
