@@ -518,6 +518,16 @@ namespace ctranslate2 {
       return value;
     }
 
+    // CT2_XPU_TILED_GEMM=1 is the same GEMM done properly, and it exists to separate two
+    // readings of the naive one's result. The naive kernel keeps the fault away, but it is
+    // also about 16x slower than oneMKL, and being slower has been a workaround here
+    // before - CT2_XPU_SYNC costs 5x and also fixes it. If the fault stays away at a speed
+    // close to oneMKL's, then it was never about how much work was in flight.
+    static bool tiled_gemm_enabled() {
+      static const bool value = read_bool_from_env("CT2_XPU_TILED_GEMM", false);
+      return value;
+    }
+
     // One work-item per output element, accumulating in accum_type so the 16-bit types do
     // not lose the sum. Handles the batched case too: a single GEMM is batch_size 1 with
     // zero strides.
@@ -573,6 +583,91 @@ namespace ctranslate2 {
 
     // CTranslate2 stores matrices row-major, which oneMKL supports directly - no need
     // for the a/b swap the cuBLAS path does.
+    // 16x16 tiles staged through local memory, one work-item per output element. Padded
+    // to whole tiles with the bounds checks hoisted out of the barrier region, so every
+    // work-item in a group reaches both barriers.
+    template <typename T>
+    static void tiled_gemm(bool transpose_a, bool transpose_b,
+                           dim_t m, dim_t n, dim_t k,
+                           float alpha,
+                           const T* a, dim_t lda, dim_t stridea,
+                           const T* b, dim_t ldb, dim_t strideb,
+                           float beta,
+                           T* c, dim_t ldc, dim_t stridec,
+                           dim_t batch_size) {
+      if (m <= 0 || n <= 0 || batch_size <= 0)
+        return;
+      using DT = device_type<T>;
+      using AT = accum_type<T>;
+      // Aliased because SYCL_CHECK takes a single macro argument and the comma inside
+      // local_accessor<AT, 2> would split it.
+      using LocalTile = ::sycl::local_accessor<AT, 2>;
+      constexpr size_t tile = 16;
+      const auto* A = device_cast(a);
+      const auto* B = device_cast(b);
+      auto* C = device_cast(c);
+      const size_t mm = static_cast<size_t>(m);
+      const size_t nn = static_cast<size_t>(n);
+      const size_t kk = static_cast<size_t>(k);
+      const size_t la = static_cast<size_t>(lda);
+      const size_t lb = static_cast<size_t>(ldb);
+      const size_t lc = static_cast<size_t>(ldc);
+      const size_t sa = static_cast<size_t>(stridea);
+      const size_t sb = static_cast<size_t>(strideb);
+      const size_t sc = static_cast<size_t>(stridec);
+      const bool ta = transpose_a;
+      const bool tb = transpose_b;
+      const float al = alpha;
+      const float be = beta;
+      const size_t batches = static_cast<size_t>(batch_size);
+      const size_t gm = ((mm + tile - 1) / tile) * tile;
+      const size_t gn = ((nn + tile - 1) / tile) * tile;
+      const size_t ktiles = (kk + tile - 1) / tile;
+
+      auto submit = [&](::sycl::handler& h) {
+        LocalTile as(::sycl::range<2>(tile, tile), h);
+        LocalTile bs(::sycl::range<2>(tile, tile), h);
+        h.parallel_for(::sycl::nd_range<3>(::sycl::range<3>(batches, gm, gn),
+                                           ::sycl::range<3>(1, tile, tile)),
+                       [=](::sycl::nd_item<3> it) {
+                         const size_t bi = it.get_global_id(0);
+                         const size_t i = it.get_global_id(1);
+                         const size_t j = it.get_global_id(2);
+                         const size_t li = it.get_local_id(1);
+                         const size_t lj = it.get_local_id(2);
+                         const auto* ab = A + bi * sa;
+                         const auto* bb = B + bi * sb;
+                         auto* cb = C + bi * sc;
+                         AT acc = AT(0);
+                         for (size_t t = 0; t < ktiles; ++t) {
+                           const size_t pa = t * tile + lj;
+                           const size_t pb = t * tile + li;
+                           AT av = AT(0);
+                           if (i < mm && pa < kk)
+                             av = static_cast<AT>(ta ? ab[pa * la + i] : ab[i * la + pa]);
+                           AT bv = AT(0);
+                           if (j < nn && pb < kk)
+                             bv = static_cast<AT>(tb ? bb[j * lb + pb] : bb[pb * lb + j]);
+                           as[li][lj] = av;
+                           bs[li][lj] = bv;
+                           ::sycl::group_barrier(it.get_group());
+                           for (size_t p = 0; p < tile; ++p)
+                             acc += as[li][p] * bs[p][lj];
+                           ::sycl::group_barrier(it.get_group());
+                         }
+                         if (i < mm && j < nn) {
+                           const size_t ci = i * lc + j;
+                           AT prev = AT(0);
+                           if (be != 0.0f)
+                             prev = static_cast<AT>(cb[ci]);
+                           cb[ci] = static_cast<DT>(static_cast<AT>(al) * acc
+                                                    + static_cast<AT>(be) * prev);
+                         }
+                       });
+      };
+      SYCL_CHECK(get_queue().submit(submit));
+    }
+
     template <typename T>
     static void mkl_gemm(bool transpose_a, bool transpose_b,
                          dim_t m, dim_t n, dim_t k,
@@ -581,6 +676,11 @@ namespace ctranslate2 {
                          const T* b, dim_t ldb,
                          float beta,
                          T* c, dim_t ldc) {
+      if (tiled_gemm_enabled()) {
+        tiled_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
+                      a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
+        return;
+      }
       if (naive_gemm_enabled()) {
         naive_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
                       a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
@@ -607,6 +707,11 @@ namespace ctranslate2 {
                                        float beta,
                                        T* c, dim_t ldc, dim_t stridec,
                                        dim_t batch_size) {
+      if (tiled_gemm_enabled()) {
+        tiled_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
+                      a, lda, stridea, b, ldb, strideb, beta, c, ldc, stridec, batch_size);
+        return;
+      }
       if (naive_gemm_enabled()) {
         naive_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
                       a, lda, stridea, b, ldb, strideb, beta, c, ldc, stridec, batch_size);
