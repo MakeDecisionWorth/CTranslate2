@@ -5,6 +5,7 @@
 
 #include <oneapi/mkl/blas.hpp>
 
+#include "env.h"
 #include "type_dispatch.h"
 #include "helpers.h"
 #include "utils.h"
@@ -501,6 +502,75 @@ namespace ctranslate2 {
       return transpose ? ::oneapi::mkl::transpose::trans : ::oneapi::mkl::transpose::nontrans;
     }
 
+    // CT2_XPU_NAIVE_GEMM=1 replaces every oneMKL call below with the plain SYCL kernel
+    // that follows. It is a diagnostic, not a fast path - expect several times the time
+    // per window.
+    //
+    // Why it exists: on 2026-08-11 llama.cpp's SYCL backend ran 400 s clean on this A770
+    // with the desktop compositor at 9-11% of the card, while CTranslate2 died on window 0
+    // with the same compositor at 2-3%. Of the differences between the two backends, the
+    // GEMM library is the cheapest to swap, and llama.cpp uses oneDNN rather than oneMKL.
+    // This also finally tests the assumption the whole allocator rests on - that every
+    // submission goes to the one in-order queue we created - because nothing here submits
+    // anywhere else.
+    static bool naive_gemm_enabled() {
+      static const bool value = read_bool_from_env("CT2_XPU_NAIVE_GEMM", false);
+      return value;
+    }
+
+    // One work-item per output element, accumulating in accum_type so the 16-bit types do
+    // not lose the sum. Handles the batched case too: a single GEMM is batch_size 1 with
+    // zero strides.
+    template <typename T>
+    static void naive_gemm(bool transpose_a, bool transpose_b,
+                           dim_t m, dim_t n, dim_t k,
+                           float alpha,
+                           const T* a, dim_t lda, dim_t stridea,
+                           const T* b, dim_t ldb, dim_t strideb,
+                           float beta,
+                           T* c, dim_t ldc, dim_t stridec,
+                           dim_t batch_size) {
+      if (m <= 0 || n <= 0 || batch_size <= 0)
+        return;
+      using DT = device_type<T>;
+      using AT = accum_type<T>;
+      const auto* A = device_cast(a);
+      const auto* B = device_cast(b);
+      auto* C = device_cast(c);
+      const size_t kk = static_cast<size_t>(k);
+      const size_t sa = static_cast<size_t>(stridea);
+      const size_t sb = static_cast<size_t>(strideb);
+      const size_t sc = static_cast<size_t>(stridec);
+      const size_t la = static_cast<size_t>(lda);
+      const size_t lb = static_cast<size_t>(ldb);
+      const size_t lc = static_cast<size_t>(ldc);
+      const bool ta = transpose_a;
+      const bool tb = transpose_b;
+      SYCL_CHECK(get_queue().parallel_for(
+                   ::sycl::range<3>(static_cast<size_t>(batch_size),
+                                    static_cast<size_t>(m),
+                                    static_cast<size_t>(n)),
+                   [=](::sycl::id<3> id) {
+                     const size_t bi = id[0];
+                     const size_t i = id[1];
+                     const size_t j = id[2];
+                     const auto* ab = A + bi * sa;
+                     const auto* bb = B + bi * sb;
+                     auto* cb = C + bi * sc;
+                     AT acc = AT(0);
+                     for (size_t p = 0; p < kk; ++p) {
+                       const AT av = static_cast<AT>(ta ? ab[p * la + i] : ab[i * la + p]);
+                       const AT bv = static_cast<AT>(tb ? bb[j * lb + p] : bb[p * lb + j]);
+                       acc += av * bv;
+                     }
+                     // beta == 0 must not read C: it is allowed to be uninitialised.
+                     const size_t ci = i * lc + j;
+                     const AT prev = (beta == 0.0f) ? AT(0) : static_cast<AT>(cb[ci]);
+                     cb[ci] = static_cast<DT>(static_cast<AT>(alpha) * acc
+                                              + static_cast<AT>(beta) * prev);
+                   }));
+    }
+
     // CTranslate2 stores matrices row-major, which oneMKL supports directly - no need
     // for the a/b swap the cuBLAS path does.
     template <typename T>
@@ -511,6 +581,11 @@ namespace ctranslate2 {
                          const T* b, dim_t ldb,
                          float beta,
                          T* c, dim_t ldc) {
+      if (naive_gemm_enabled()) {
+        naive_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
+                      a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
+        return;
+      }
       using DT = device_type<T>;
       SYCL_CHECK(::oneapi::mkl::blas::row_major::gemm(get_queue(),
                                                       to_mkl_transpose(transpose_a),
@@ -532,6 +607,11 @@ namespace ctranslate2 {
                                        float beta,
                                        T* c, dim_t ldc, dim_t stridec,
                                        dim_t batch_size) {
+      if (naive_gemm_enabled()) {
+        naive_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
+                      a, lda, stridea, b, ldb, strideb, beta, c, ldc, stridec, batch_size);
+        return;
+      }
       using DT = device_type<T>;
       SYCL_CHECK(::oneapi::mkl::blas::row_major::gemm_batch(get_queue(),
                                                             to_mkl_transpose(transpose_a),
