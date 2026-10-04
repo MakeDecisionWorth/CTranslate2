@@ -87,3 +87,14 @@ Configure the default logs verbosity:
 ```{tip}
 The log level can also be controlled by API. See for example the Python function [`ctranslate2.set_log_level`](python/ctranslate2.set_log_level.rst).
 ```
+
+## `CT2_XPU_BACKEND`
+
+Select the SYCL backend used to run on Intel GPUs (`device="xpu"`):
+
+* `opencl` (default)
+* `level_zero`
+
+Level Zero is about 15% faster, but on an Intel Arc GPU that is also compositing a desktop (a monitor connected to it, or a remote desktop session streaming it) some decodes have been observed to silently produce wrong output. Use `level_zero` only on a GPU that drives no display.
+
+Device indices follow Level Zero's numbering with either backend, so `device_index` refers to the same GPU as in `torch.xpu`.

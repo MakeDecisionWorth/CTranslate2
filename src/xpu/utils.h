@@ -30,9 +30,10 @@ namespace ctranslate2 {
       }                                                                 \
     } while (false)
 
-    // The GPUs visible to the SYCL runtime, in a stable order. Level Zero is
-    // preferred over OpenCL because it is the backend PyTorch also uses, which keeps
-    // the device numbering consistent with torch.xpu.
+    // The GPUs visible to the SYCL runtime, each listed once and numbered in Level
+    // Zero's order - the order PyTorch uses, so that a device index means the same card
+    // as in torch.xpu - but run through the backend CT2_XPU_BACKEND selects, OpenCL by
+    // default. See discover_devices() for why.
     const std::vector<::sycl::device>& get_devices();
 
     int get_gpu_count();
@@ -59,6 +60,10 @@ namespace ctranslate2 {
     // Layout: [0] = violation count, [1] = last offending index, [2] = the bound.
     bool check_bounds();
     int32_t* bounds_report();
+
+    // Host to device copy of the current device, staged through USM host memory and
+    // complete on return. See the definition for why it is not a plain memcpy.
+    void copy_from_host(void* dst, const void* src, size_t bytes);
 
     void synchronize_device();
     void synchronize_queue();

@@ -5,6 +5,7 @@
 #include <mutex>
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 
 #include <spdlog/spdlog.h>
@@ -14,9 +15,34 @@
 namespace ctranslate2 {
   namespace xpu {
 
-    static std::vector<::sycl::device> discover_devices() {
+    static std::vector<::sycl::device> devices_of(::sycl::backend backend,
+                                                  ::sycl::info::device_type type) {
       std::vector<::sycl::device> devices;
+      for (const auto& platform : ::sycl::platform::get_platforms()) {
+        if (platform.get_backend() != backend)
+          continue;
+        for (const auto& device : platform.get_devices(type))
+          devices.emplace_back(device);
+      }
+      return devices;
+    }
 
+    // The same physical device as seen through another backend. Intel's drivers report
+    // one UUID per card on both Level Zero and OpenCL.
+    static const ::sycl::device* find_same_device(const ::sycl::device& device,
+                                                  const std::vector<::sycl::device>& candidates) {
+      if (!device.has(::sycl::aspect::ext_intel_device_info_uuid))
+        return nullptr;
+      const auto uuid = device.get_info<::sycl::ext::intel::info::device::uuid>();
+      for (const auto& candidate : candidates) {
+        if (candidate.has(::sycl::aspect::ext_intel_device_info_uuid)
+            && candidate.get_info<::sycl::ext::intel::info::device::uuid>() == uuid)
+          return &candidate;
+      }
+      return nullptr;
+    }
+
+    static std::vector<::sycl::device> discover_devices() {
       // Set CT2_XPU_DEVICE_TYPE=cpu to run the SYCL kernels on the OpenCL CPU device.
       // That is not a configuration to deploy - it exists so the kernels can be run
       // under a sanitizer or a debugger on hosts where the GPU path cannot be, and it
@@ -25,20 +51,45 @@ namespace ctranslate2 {
       const auto wanted = (device_type == "cpu" ? ::sycl::info::device_type::cpu
                            : ::sycl::info::device_type::gpu);
 
-      // Prefer a single backend so device indices stay stable and each physical GPU
-      // is listed once. Level Zero first, to match PyTorch's XPU device numbering.
-      for (const auto backend : {::sycl::backend::ext_oneapi_level_zero,
-                                 ::sycl::backend::opencl}) {
-        for (const auto& platform : ::sycl::platform::get_platforms()) {
-          if (platform.get_backend() != backend)
-            continue;
-          for (const auto& device : platform.get_devices(wanted))
-            devices.emplace_back(device);
-        }
-        if (!devices.empty())
-          break;
-      }
+      // CT2_XPU_BACKEND picks the runtime the kernels are submitted through: "opencl"
+      // (the default) or "level_zero". Level Zero is ~15% faster, but on an Arc A770
+      // that is also compositing a desktop - a monitor on it, a Parsec session streaming
+      // it - some of its decodes silently go wrong, several in every five minutes: a
+      // beam steered into a repetition loop or a different transcript, with no error
+      // anywhere. The same binary through OpenCL, on the same card under the same load,
+      // has been clean, and no Level Zero setting tried changed it (copy engine,
+      // immediate or driver in-order command lists, the v2 adapter). A wrong transcript
+      // nobody notices is worse than a slower one, so OpenCL is the default; a card that
+      // drives no display is fine on Level Zero.
+      const std::string backend = read_string_from_env("CT2_XPU_BACKEND", "opencl");
+      if (backend != "opencl" && backend != "level_zero")
+        throw std::invalid_argument("Invalid CT2_XPU_BACKEND: " + backend
+                                    + " (expected opencl or level_zero)");
 
+      const auto level_zero = devices_of(::sycl::backend::ext_oneapi_level_zero, wanted);
+      const auto opencl = devices_of(::sycl::backend::opencl, wanted);
+
+      // Devices are numbered in Level Zero's order whenever Level Zero lists any, because
+      // that is PyTorch's XPU numbering: device_index has to name the same card as
+      // torch.xpu does, whichever backend runs it. Each physical GPU is listed once.
+      if (level_zero.empty())
+        return opencl;
+      if (backend == "level_zero")
+        return level_zero;
+
+      std::vector<::sycl::device> devices;
+      for (const auto& device : level_zero) {
+        const auto* same = find_same_device(device, opencl);
+        if (same) {
+          devices.emplace_back(*same);
+        } else {
+          // No OpenCL GPU runtime, or ONEAPI_DEVICE_SELECTOR hid it. Keep the card,
+          // on Level Zero, rather than shifting every index after it.
+          spdlog::warn("No OpenCL device found for {}; using it through Level Zero",
+                       device.get_info<::sycl::info::device::name>());
+          devices.emplace_back(device);
+        }
+      }
       return devices;
     }
 
@@ -153,8 +204,10 @@ namespace ctranslate2 {
 
         static std::once_flag log_once_flag;
         std::call_once(log_once_flag, [&device]() {
-          spdlog::info("Using SYCL device: {}",
-                       device.get_info<::sycl::info::device::name>());
+          spdlog::info("Using SYCL device: {} ({})",
+                       device.get_info<::sycl::info::device::name>(),
+                       device.get_backend() == ::sycl::backend::opencl ? "OpenCL"
+                       : "Level Zero");
         });
 
         it = cache.emplace(index, std::move(queue)).first;
@@ -181,6 +234,37 @@ namespace ctranslate2 {
         return buffer;
       }();
       return report;
+    }
+
+    // Copies to the device go through a USM host buffer instead of straight from the
+    // caller's memory. Through OpenCL on an A750 with no display, a copy from ordinary
+    // pageable memory - even 16 bytes - could leave the wait on it blocked for over a
+    // minute with the card idle, so that the second decode of a window took 77-431 s
+    // against 4.5 s for the first; copies from the device, and Level Zero, never did.
+    // Staging is what the runtime would otherwise do for such a copy anyway.
+    void copy_from_host(void* dst, const void* src, size_t bytes) {
+      constexpr size_t chunk = 4 << 20;
+      static std::mutex mutex;
+      static std::map<int, void*> staging;
+      if (bytes == 0)
+        return;
+      const std::lock_guard<std::mutex> lock(mutex);
+      auto& queue = get_queue();
+      void*& buffer = staging[current_device_index];
+      if (!buffer) {
+        buffer = ::sycl::malloc_host(chunk, get_context(current_device_index));
+        if (!buffer)
+          THROW_RUNTIME_ERROR("Failed to allocate the XPU host staging buffer");
+      }
+      auto* out = static_cast<char*>(dst);
+      const auto* in = static_cast<const char*>(src);
+      for (size_t offset = 0; offset < bytes; offset += chunk) {
+        const size_t n = std::min(chunk, bytes - offset);
+        std::memcpy(buffer, in + offset, n);
+        // Waited on before the buffer is refilled, and before returning: the caller may
+        // overwrite or free src as soon as this returns.
+        SYCL_CHECK(queue.memcpy(out + offset, buffer, n).wait());
+      }
     }
 
     void synchronize_device() {
@@ -214,9 +298,9 @@ namespace ctranslate2 {
     }
 
     bool gpu_supports_int8(int) {
-      // Reported as unsupported until the oneMKL int8 GEMM path is implemented, so that
-      // resolve_compute_type() falls back to a float type instead of selecting a
-      // quantized path with no kernels behind it.
+      // Reported as unsupported until there is an int8 GEMM (DG2's XMX engines do take
+      // int8), so that resolve_compute_type() falls back to a float type instead of
+      // selecting a quantized path with no kernels behind it.
       return false;
     }
 

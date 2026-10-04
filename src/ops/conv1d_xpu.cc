@@ -8,7 +8,7 @@ namespace ctranslate2 {
   namespace ops {
 
     // Same strategy as the CUDA path: build the im2col buffer with one kernel, then let
-    // the batched GEMM (oneMKL) do the actual convolution.
+    // the batched GEMM (the XMX kernels) do the actual convolution.
     template <Device D, typename T>
     void Conv1D::compute(const StorageView& input,
                          const StorageView& weight,

@@ -281,6 +281,7 @@ set(SYCL_HEADER_SOURCES
 
 set(SYCL_SOURCES
   src/xpu/allocator.cc
+  src/xpu/gemm_xmx.cc
   src/xpu/primitives.cc
   src/xpu/utils.cc
   src/ops/alibi_add_xpu.cc
@@ -439,13 +440,13 @@ if(WITH_MKL)
 
   add_definitions(-DCT2_WITH_MKL -DMKL_ILP64)
   if(WIN32 AND WITH_SYCL)
-    # oneMKL only ships the SYCL BLAS as an import library, so the whole MKL link has
-    # to be dynamic - a static CPU MKL next to a dynamic SYCL MKL would put two copies
-    # of the runtime in one process.
+    # Dynamic MKL for the CPU side of a SYCL build. This was forced when the XPU GEMMs
+    # ran on oneMKL's SYCL BLAS, which ships as an import library only and must not sit
+    # next to a second, static MKL runtime. The XPU GEMMs no longer use oneMKL; the
+    # dynamic link is kept so that the runtime a SYCL build ships does not change.
     set(MKL_LIBRARIES
       ${MKL_LIBRARY_DIR}/mkl_core_dll.lib
       ${MKL_LIBRARY_DIR}/mkl_intel_ilp64_dll.lib
-      ${MKL_LIBRARY_DIR}/mkl_sycl_blas_dll.lib
       )
   elseif(WIN32)
     set(MKL_LIBRARIES
@@ -453,13 +454,11 @@ if(WITH_MKL)
       ${MKL_LIBRARY_DIR}/mkl_intel_ilp64.lib
       )
   elseif(WITH_SYCL)
-    # Same reasoning as the Windows branch above: the SYCL BLAS is shared-only, so the
-    # CPU side has to be shared too rather than mixing in the static archives.
+    # Shared, as in the Windows branch above and for the same history.
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64")
     set(MKL_LIBRARIES
       ${MKL_LIBRARY_DIR}/libmkl_core.so
       ${MKL_LIBRARY_DIR}/libmkl_intel_ilp64.so
-      ${MKL_LIBRARY_DIR}/libmkl_sycl_blas.so
       )
   else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m64")

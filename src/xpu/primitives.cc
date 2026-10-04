@@ -3,10 +3,8 @@
 #include <cmath>
 #include <cstring>
 
-#include <oneapi/mkl/blas.hpp>
-
-#include "env.h"
 #include "type_dispatch.h"
+#include "gemm_xmx.h"
 #include "helpers.h"
 #include "utils.h"
 
@@ -483,7 +481,7 @@ namespace ctranslate2 {
   void cross_device_primitives<Device::CPU, Device::XPU>::copy(const T* x, T* y, dim_t size) {
     if (size <= 0)
       return;
-    SYCL_CHECK(xpu::get_queue().memcpy(y, x, size * sizeof (T)).wait());
+    xpu::copy_from_host(y, x, size * sizeof (T));
   }
 
   template<>
@@ -494,259 +492,10 @@ namespace ctranslate2 {
     SYCL_CHECK(xpu::get_queue().memcpy(y, x, size * sizeof (T)).wait());
   }
 
-  // GEMM entry points, specialised on the same type pairs as the CUDA backend.
-
-  namespace xpu {
-
-    inline ::oneapi::mkl::transpose to_mkl_transpose(bool transpose) {
-      return transpose ? ::oneapi::mkl::transpose::trans : ::oneapi::mkl::transpose::nontrans;
-    }
-
-    // CT2_XPU_NAIVE_GEMM=1 replaces every oneMKL call below with the plain SYCL kernel
-    // that follows. It is a diagnostic, not a fast path - expect several times the time
-    // per window.
-    //
-    // Why it exists: on 2026-08-11 llama.cpp's SYCL backend ran 400 s clean on this A770
-    // with the desktop compositor at 9-11% of the card, while CTranslate2 died on window 0
-    // with the same compositor at 2-3%. Of the differences between the two backends, the
-    // GEMM library is the cheapest to swap, and llama.cpp uses oneDNN rather than oneMKL.
-    // This also finally tests the assumption the whole allocator rests on - that every
-    // submission goes to the one in-order queue we created - because nothing here submits
-    // anywhere else.
-    static bool naive_gemm_enabled() {
-      static const bool value = read_bool_from_env("CT2_XPU_NAIVE_GEMM", false);
-      return value;
-    }
-
-    // CT2_XPU_TILED_GEMM=1 is the same GEMM done properly, and it exists to separate two
-    // readings of the naive one's result. The naive kernel keeps the fault away, but it is
-    // also about 16x slower than oneMKL, and being slower has been a workaround here
-    // before - CT2_XPU_SYNC costs 5x and also fixes it. If the fault stays away at a speed
-    // close to oneMKL's, then it was never about how much work was in flight.
-    static bool tiled_gemm_enabled() {
-      static const bool value = read_bool_from_env("CT2_XPU_TILED_GEMM", false);
-      return value;
-    }
-
-    // The two oneMKL entry points can also be replaced one at a time. They live in the
-    // same library - both resolve to mkl_sycl_blas.6.dll - but not in the same code: a
-    // batched GEMM on this hardware is its own kernel with its own tiling and a much
-    // larger amount of work per submission, so one can be at fault while the other is
-    // fine. Knowing which would allow keeping oneMKL's speed on the healthy path, and
-    // makes a far more precise bug report than "oneMKL's GEMM".
-    static bool tiled_single_enabled() {
-      static const bool value = read_bool_from_env("CT2_XPU_TILED_GEMM_SINGLE", false);
-      return value;
-    }
-
-    static bool tiled_batch_enabled() {
-      static const bool value = read_bool_from_env("CT2_XPU_TILED_GEMM_BATCH", false);
-      return value;
-    }
-
-    // One work-item per output element, accumulating in accum_type so the 16-bit types do
-    // not lose the sum. Handles the batched case too: a single GEMM is batch_size 1 with
-    // zero strides.
-    template <typename T>
-    static void naive_gemm(bool transpose_a, bool transpose_b,
-                           dim_t m, dim_t n, dim_t k,
-                           float alpha,
-                           const T* a, dim_t lda, dim_t stridea,
-                           const T* b, dim_t ldb, dim_t strideb,
-                           float beta,
-                           T* c, dim_t ldc, dim_t stridec,
-                           dim_t batch_size) {
-      if (m <= 0 || n <= 0 || batch_size <= 0)
-        return;
-      using DT = device_type<T>;
-      using AT = accum_type<T>;
-      const auto* A = device_cast(a);
-      const auto* B = device_cast(b);
-      auto* C = device_cast(c);
-      const size_t kk = static_cast<size_t>(k);
-      const size_t sa = static_cast<size_t>(stridea);
-      const size_t sb = static_cast<size_t>(strideb);
-      const size_t sc = static_cast<size_t>(stridec);
-      const size_t la = static_cast<size_t>(lda);
-      const size_t lb = static_cast<size_t>(ldb);
-      const size_t lc = static_cast<size_t>(ldc);
-      const bool ta = transpose_a;
-      const bool tb = transpose_b;
-      SYCL_CHECK(get_queue().parallel_for(
-                   ::sycl::range<3>(static_cast<size_t>(batch_size),
-                                    static_cast<size_t>(m),
-                                    static_cast<size_t>(n)),
-                   [=](::sycl::id<3> id) {
-                     const size_t bi = id[0];
-                     const size_t i = id[1];
-                     const size_t j = id[2];
-                     const auto* ab = A + bi * sa;
-                     const auto* bb = B + bi * sb;
-                     auto* cb = C + bi * sc;
-                     AT acc = AT(0);
-                     for (size_t p = 0; p < kk; ++p) {
-                       const AT av = static_cast<AT>(ta ? ab[p * la + i] : ab[i * la + p]);
-                       const AT bv = static_cast<AT>(tb ? bb[j * lb + p] : bb[p * lb + j]);
-                       acc += av * bv;
-                     }
-                     // beta == 0 must not read C: it is allowed to be uninitialised.
-                     const size_t ci = i * lc + j;
-                     const AT prev = (beta == 0.0f) ? AT(0) : static_cast<AT>(cb[ci]);
-                     cb[ci] = static_cast<DT>(static_cast<AT>(alpha) * acc
-                                              + static_cast<AT>(beta) * prev);
-                   }));
-    }
-
-    // CTranslate2 stores matrices row-major, which oneMKL supports directly - no need
-    // for the a/b swap the cuBLAS path does.
-    // 16x16 tiles staged through local memory, one work-item per output element. Padded
-    // to whole tiles with the bounds checks hoisted out of the barrier region, so every
-    // work-item in a group reaches both barriers.
-    template <typename T>
-    static void tiled_gemm(bool transpose_a, bool transpose_b,
-                           dim_t m, dim_t n, dim_t k,
-                           float alpha,
-                           const T* a, dim_t lda, dim_t stridea,
-                           const T* b, dim_t ldb, dim_t strideb,
-                           float beta,
-                           T* c, dim_t ldc, dim_t stridec,
-                           dim_t batch_size) {
-      if (m <= 0 || n <= 0 || batch_size <= 0)
-        return;
-      using DT = device_type<T>;
-      using AT = accum_type<T>;
-      // Aliased because SYCL_CHECK takes a single macro argument and the comma inside
-      // local_accessor<AT, 2> would split it.
-      using LocalTile = ::sycl::local_accessor<AT, 2>;
-      constexpr size_t tile = 16;
-      const auto* A = device_cast(a);
-      const auto* B = device_cast(b);
-      auto* C = device_cast(c);
-      const size_t mm = static_cast<size_t>(m);
-      const size_t nn = static_cast<size_t>(n);
-      const size_t kk = static_cast<size_t>(k);
-      const size_t la = static_cast<size_t>(lda);
-      const size_t lb = static_cast<size_t>(ldb);
-      const size_t lc = static_cast<size_t>(ldc);
-      const size_t sa = static_cast<size_t>(stridea);
-      const size_t sb = static_cast<size_t>(strideb);
-      const size_t sc = static_cast<size_t>(stridec);
-      const bool ta = transpose_a;
-      const bool tb = transpose_b;
-      const float al = alpha;
-      const float be = beta;
-      const size_t batches = static_cast<size_t>(batch_size);
-      const size_t gm = ((mm + tile - 1) / tile) * tile;
-      const size_t gn = ((nn + tile - 1) / tile) * tile;
-      const size_t ktiles = (kk + tile - 1) / tile;
-
-      auto submit = [&](::sycl::handler& h) {
-        LocalTile as(::sycl::range<2>(tile, tile), h);
-        LocalTile bs(::sycl::range<2>(tile, tile), h);
-        h.parallel_for(::sycl::nd_range<3>(::sycl::range<3>(batches, gm, gn),
-                                           ::sycl::range<3>(1, tile, tile)),
-                       [=](::sycl::nd_item<3> it) {
-                         const size_t bi = it.get_global_id(0);
-                         const size_t i = it.get_global_id(1);
-                         const size_t j = it.get_global_id(2);
-                         const size_t li = it.get_local_id(1);
-                         const size_t lj = it.get_local_id(2);
-                         const auto* ab = A + bi * sa;
-                         const auto* bb = B + bi * sb;
-                         auto* cb = C + bi * sc;
-                         AT acc = AT(0);
-                         for (size_t t = 0; t < ktiles; ++t) {
-                           const size_t pa = t * tile + lj;
-                           const size_t pb = t * tile + li;
-                           AT av = AT(0);
-                           if (i < mm && pa < kk)
-                             av = static_cast<AT>(ta ? ab[pa * la + i] : ab[i * la + pa]);
-                           AT bv = AT(0);
-                           if (j < nn && pb < kk)
-                             bv = static_cast<AT>(tb ? bb[j * lb + pb] : bb[pb * lb + j]);
-                           as[li][lj] = av;
-                           bs[li][lj] = bv;
-                           ::sycl::group_barrier(it.get_group());
-                           for (size_t p = 0; p < tile; ++p)
-                             acc += as[li][p] * bs[p][lj];
-                           ::sycl::group_barrier(it.get_group());
-                         }
-                         if (i < mm && j < nn) {
-                           const size_t ci = i * lc + j;
-                           AT prev = AT(0);
-                           if (be != 0.0f)
-                             prev = static_cast<AT>(cb[ci]);
-                           cb[ci] = static_cast<DT>(static_cast<AT>(al) * acc
-                                                    + static_cast<AT>(be) * prev);
-                         }
-                       });
-      };
-      SYCL_CHECK(get_queue().submit(submit));
-    }
-
-    template <typename T>
-    static void mkl_gemm(bool transpose_a, bool transpose_b,
-                         dim_t m, dim_t n, dim_t k,
-                         float alpha,
-                         const T* a, dim_t lda,
-                         const T* b, dim_t ldb,
-                         float beta,
-                         T* c, dim_t ldc) {
-      if (tiled_gemm_enabled() || tiled_single_enabled()) {
-        tiled_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
-                      a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
-        return;
-      }
-      if (naive_gemm_enabled()) {
-        naive_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
-                      a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
-        return;
-      }
-      using DT = device_type<T>;
-      SYCL_CHECK(::oneapi::mkl::blas::row_major::gemm(get_queue(),
-                                                      to_mkl_transpose(transpose_a),
-                                                      to_mkl_transpose(transpose_b),
-                                                      m, n, k,
-                                                      static_cast<DT>(alpha),
-                                                      device_cast(a), lda,
-                                                      device_cast(b), ldb,
-                                                      static_cast<DT>(beta),
-                                                      device_cast(c), ldc));
-    }
-
-    template <typename T>
-    static void mkl_gemm_batch_strided(bool transpose_a, bool transpose_b,
-                                       dim_t m, dim_t n, dim_t k,
-                                       float alpha,
-                                       const T* a, dim_t lda, dim_t stridea,
-                                       const T* b, dim_t ldb, dim_t strideb,
-                                       float beta,
-                                       T* c, dim_t ldc, dim_t stridec,
-                                       dim_t batch_size) {
-      if (tiled_gemm_enabled() || tiled_batch_enabled()) {
-        tiled_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
-                      a, lda, stridea, b, ldb, strideb, beta, c, ldc, stridec, batch_size);
-        return;
-      }
-      if (naive_gemm_enabled()) {
-        naive_gemm<T>(transpose_a, transpose_b, m, n, k, alpha,
-                      a, lda, stridea, b, ldb, strideb, beta, c, ldc, stridec, batch_size);
-        return;
-      }
-      using DT = device_type<T>;
-      SYCL_CHECK(::oneapi::mkl::blas::row_major::gemm_batch(get_queue(),
-                                                            to_mkl_transpose(transpose_a),
-                                                            to_mkl_transpose(transpose_b),
-                                                            m, n, k,
-                                                            static_cast<DT>(alpha),
-                                                            device_cast(a), lda, stridea,
-                                                            device_cast(b), ldb, strideb,
-                                                            static_cast<DT>(beta),
-                                                            device_cast(c), ldc, stridec,
-                                                            batch_size));
-    }
-
-  }
+  // GEMM entry points, specialised on the same type pairs as the CUDA backend. Every
+  // float16 and float32 GEMM runs on the XMX kernels in gemm_xmx.cc, never on oneMKL:
+  // oneMKL's float16 GEMM faults the GPU while a desktop compositor is working on the
+  // same card. gemm_xmx.cc has the details.
 
   template<>
   template<>
@@ -759,7 +508,8 @@ namespace ctranslate2 {
                                      float beta,
                                      float* c, dim_t ldc,
                                      const float*) {
-    xpu::mkl_gemm(transpose_a, transpose_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+    xpu::xmx_gemm(transpose_a, transpose_b, m, n, k, alpha,
+                  a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
   }
 
   template<>
@@ -773,7 +523,8 @@ namespace ctranslate2 {
                                      float beta,
                                      float16_t* c, dim_t ldc,
                                      const float16_t*) {
-    xpu::mkl_gemm(transpose_a, transpose_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+    xpu::xmx_gemm(transpose_a, transpose_b, m, n, k, alpha,
+                  a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
   }
 
   template<>
@@ -814,9 +565,9 @@ namespace ctranslate2 {
                                                    float beta,
                                                    float* c, dim_t ldc, dim_t stridec,
                                                    dim_t batch_size) {
-    xpu::mkl_gemm_batch_strided(transpose_a, transpose_b, m, n, k, alpha,
-                                a, lda, stridea, b, ldb, strideb,
-                                beta, c, ldc, stridec, batch_size);
+    xpu::xmx_gemm(transpose_a, transpose_b, m, n, k, alpha,
+                  a, lda, stridea, b, ldb, strideb,
+                  beta, c, ldc, stridec, batch_size);
   }
 
   template<>
@@ -829,9 +580,9 @@ namespace ctranslate2 {
                                                    float beta,
                                                    float16_t* c, dim_t ldc, dim_t stridec,
                                                    dim_t batch_size) {
-    xpu::mkl_gemm_batch_strided(transpose_a, transpose_b, m, n, k, alpha,
-                                a, lda, stridea, b, ldb, strideb,
-                                beta, c, ldc, stridec, batch_size);
+    xpu::xmx_gemm(transpose_a, transpose_b, m, n, k, alpha,
+                  a, lda, stridea, b, ldb, strideb,
+                  beta, c, ldc, stridec, batch_size);
   }
 
   template<>

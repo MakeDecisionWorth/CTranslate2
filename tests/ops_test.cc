@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <random>
 #include <thread>
 #include <set>
@@ -768,6 +770,244 @@ TEST_P(OpDeviceFPTest, GemmGELU) {
     expect_storage_eq(y.to_float32(), expected, error);
   }
 };
+
+// Whisper's shapes. The Gemm test above is 4x2, three orders of magnitude short of them,
+// and nothing else ran a device GEMM past a single tile. m is the beam (or batch x beam),
+// n and k the model's projections; the odd sizes cover partial tiles in every transpose
+// combination, and alpha and beta are both kept away from 0 and 1 so that neither can be
+// dropped without the test noticing.
+TEST_P(OpDeviceFPTest, GemmLargeShapes) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+  struct Shape {
+    dim_t m, n, k;
+    bool transpose_a, transpose_b;
+  };
+  const std::vector<Shape> shapes = {
+    {4, 1280, 1280, false, true},     // attention projection, beam 4
+    {4, 5120, 1280, false, true},     // FFN up
+    {4, 1280, 5120, false, true},     // FFN down
+    {120, 3840, 1280, false, true},   // fused QKV, batch 24 x beam 5
+    {1500, 1280, 1280, false, true},  // encoder
+    // One edge at a time: only k, only m, only n is short of a whole tile.
+    {32, 64, 45, false, false},
+    {32, 64, 45, false, true},
+    {37, 64, 32, false, false},
+    {37, 64, 32, false, true},
+    {32, 77, 32, false, false},
+    {32, 77, 32, false, true},
+    {37, 77, 45, false, false},
+    {37, 77, 45, true, false},
+    {37, 77, 45, false, true},
+    {37, 77, 45, true, true},
+    {1, 8, 16, false, true},
+    // k shorter than one tile, in each family of tilings: many output tiles, one thin row
+    // of them, one thin column of them. The last kind went NaN when it wrote its output
+    // straight from its accumulators, while every shape above passed.
+    {37, 77, 5, false, false},
+    {37, 77, 5, false, true},
+    {2, 77, 5, false, false},
+    {77, 2, 5, false, true},
+    {4, 2, 3, false, false},
+    {2, 77, 5, false, true},
+    // At most 8 rows times an untransposed B: decoder attention times V.
+    {4, 64, 45, false, false},
+    {4, 64, 45, true, false},
+    {8, 128, 300, false, false},
+    {1, 72, 7, true, false},
+    // At most 8 rows times a transposed B: decoder attention scores.
+    {4, 77, 64, false, true},
+    {4, 77, 64, true, true},
+    {3, 3, 64, false, true},
+  };
+  const float alpha = 1.5f;
+  const float beta = 0.5f;
+
+  std::mt19937 gen(1234);
+  std::uniform_real_distribution<float> dist(-1.f, 1.f);
+  auto random_matrix = [&](dim_t rows, dim_t cols) {
+    std::vector<float> values(rows * cols);
+    for (auto& value : values)
+      value = dist(gen);
+    // Rounded through the tested type, so the reference starts from exactly the values the
+    // device sees and the tolerance only has to cover accumulation and the output.
+    return StorageView({rows, cols}, values).to(dtype).to_float32();
+  };
+
+  for (const auto& shape : shapes) {
+    SCOPED_TRACE(::testing::Message() << "m=" << shape.m << " n=" << shape.n
+                 << " k=" << shape.k << " ta=" << shape.transpose_a
+                 << " tb=" << shape.transpose_b);
+    const StorageView a = random_matrix(shape.transpose_a ? shape.k : shape.m,
+                                        shape.transpose_a ? shape.m : shape.k);
+    const StorageView b = random_matrix(shape.transpose_b ? shape.n : shape.k,
+                                        shape.transpose_b ? shape.k : shape.n);
+    const StorageView c = random_matrix(shape.m, shape.n);
+    const ops::Gemm op(alpha, beta, shape.transpose_a, shape.transpose_b);
+
+    StorageView expected(c);
+    op(a, b, expected);
+
+    StorageView got = c.to(device).to(dtype);
+    op(a.to(device).to(dtype), b.to(device).to(dtype), got);
+    const StorageView got_cpu = got.to_float32().to(Device::CPU);
+
+    // Relative as well as absolute: at k = 5120 the outputs reach the tens, where a single
+    // float16 ulp is already 0.03.
+    const bool fp32 = dtype == DataType::FLOAT32;
+    const float atol = fp32 ? 1e-3f : 2e-2f;
+    const float rtol = fp32 ? 1e-4f : 4e-3f;
+    const float* got_data = got_cpu.data<float>();
+    const float* expected_data = expected.data<float>();
+    dim_t mismatches = 0;
+    dim_t worst_index = 0;
+    float worst_excess = 0;
+    for (dim_t i = 0; i < expected.size(); ++i) {
+      const float excess = std::abs(got_data[i] - expected_data[i])
+                           - (atol + rtol * std::abs(expected_data[i]));
+      // Written so that NaN counts: NaN > 0 is false, and a NaN output once passed here.
+      if (!(excess <= 0)) {
+        ++mismatches;
+        if (!(excess <= worst_excess)) {
+          worst_excess = excess;
+          worst_index = i;
+        }
+      }
+    }
+    EXPECT_EQ(mismatches, 0) << "worst at index " << worst_index << ": got "
+                             << got_data[worst_index] << ", expected "
+                             << expected_data[worst_index];
+  }
+}
+
+// The batched GEMM at the shapes attention gives it during a beam search: m is the queries
+// per step, the batch is sequences x heads, and n or k is the encoder's 1500 frames or the
+// decoder's step count. Nothing else ran gemm_batch_strided past a toy size.
+TEST_P(OpDeviceFPTest, MatMulLargeShapes) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+  struct Shape {
+    dim_t batch, m, n, k;
+    bool transpose_b;
+  };
+  const std::vector<Shape> shapes = {
+    {20, 4, 1500, 64, true},     // cross-attention scores, beam 4
+    {20, 4, 64, 1500, false},    // cross-attention context
+    {80, 1, 34, 64, true},       // self-attention scores, beam 4 x 20 heads
+    {80, 1, 64, 34, false},      // self-attention context
+    {2400, 1, 1500, 64, true},   // cross-attention scores, batch 24 x beam 5 x 20 heads
+    {3, 37, 45, 77, false},
+    {3, 37, 45, 77, true},
+  };
+  const float alpha = 0.125f;  // the 1/sqrt(64) attention scaling
+
+  std::mt19937 gen(4321);
+  std::uniform_real_distribution<float> dist(-1.f, 1.f);
+  auto random_tensor = [&](dim_t batch, dim_t rows, dim_t cols) {
+    std::vector<float> values(batch * rows * cols);
+    for (auto& value : values)
+      value = dist(gen);
+    return StorageView({batch, rows, cols}, values).to(dtype).to_float32();
+  };
+
+  for (const auto& shape : shapes) {
+    SCOPED_TRACE(::testing::Message() << "batch=" << shape.batch << " m=" << shape.m
+                 << " n=" << shape.n << " k=" << shape.k << " tb=" << shape.transpose_b);
+    const StorageView a = random_tensor(shape.batch, shape.m, shape.k);
+    const StorageView b = random_tensor(shape.batch,
+                                        shape.transpose_b ? shape.n : shape.k,
+                                        shape.transpose_b ? shape.k : shape.n);
+    const ops::MatMul op(false, shape.transpose_b, alpha);
+
+    StorageView expected;
+    op(a, b, expected);
+
+    StorageView got(dtype, device);
+    op(a.to(device).to(dtype), b.to(device).to(dtype), got);
+    const StorageView got_cpu = got.to_float32().to(Device::CPU);
+
+    const bool fp32 = dtype == DataType::FLOAT32;
+    const float atol = fp32 ? 1e-3f : 2e-2f;
+    const float rtol = fp32 ? 1e-4f : 4e-3f;
+    const float* got_data = got_cpu.data<float>();
+    const float* expected_data = expected.data<float>();
+    ASSERT_EQ(got_cpu.size(), expected.size());
+    dim_t mismatches = 0;
+    dim_t worst_index = 0;
+    float worst_excess = 0;
+    for (dim_t i = 0; i < expected.size(); ++i) {
+      const float excess = std::abs(got_data[i] - expected_data[i])
+                           - (atol + rtol * std::abs(expected_data[i]));
+      // Written so that NaN counts: NaN > 0 is false, and a NaN output once passed here.
+      if (!(excess <= 0)) {
+        ++mismatches;
+        if (!(excess <= worst_excess)) {
+          worst_excess = excess;
+          worst_index = i;
+        }
+      }
+    }
+    EXPECT_EQ(mismatches, 0) << "worst at index " << worst_index << ": got "
+                             << got_data[worst_index] << ", expected "
+                             << expected_data[worst_index];
+  }
+}
+
+// The same inputs must give bit-identical outputs every time. A GEMM that reduces across
+// sub-groups is where a race would hide, and a decode is far more sensitive to one than a
+// tolerance check is: a single flipped beam is a different transcript. The shapes reach
+// each tiling the device code chooses between, including the ones that split k.
+TEST_P(OpDeviceFPTest, GemmDeterministic) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+  struct Shape {
+    dim_t batch, m, n, k;
+    bool transpose_b;
+  };
+  const std::vector<Shape> shapes = {
+    {1, 4, 1280, 1280, true},    // thin, deep k: the decoder's projections
+    {1, 4, 1280, 256, true},     // thin
+    {1, 4, 1280, 64, true},      // thin, short k
+    {80, 1, 34, 64, true},       // self-attention scores
+    {80, 1, 64, 34, false},      // self-attention context
+    {20, 4, 64, 1500, false},    // cross-attention context
+    {1, 120, 1280, 1280, true},  // batch x beam
+    {1, 512, 1280, 1280, true},  // the encoder, at a third of its length
+    {1, 37, 77, 45, false},
+  };
+  std::mt19937 gen(99);
+  std::uniform_real_distribution<float> dist(-1.f, 1.f);
+  auto random_tensor = [&](dim_t batch, dim_t rows, dim_t cols) {
+    std::vector<float> values(batch * rows * cols);
+    for (auto& value : values)
+      value = dist(gen);
+    return StorageView({batch, rows, cols}, values, device).to(dtype);
+  };
+
+  for (const auto& shape : shapes) {
+    SCOPED_TRACE(::testing::Message() << "batch=" << shape.batch << " m=" << shape.m
+                 << " n=" << shape.n << " k=" << shape.k << " tb=" << shape.transpose_b);
+    const StorageView a = random_tensor(shape.batch, shape.m, shape.k);
+    const StorageView b = random_tensor(shape.batch,
+                                        shape.transpose_b ? shape.n : shape.k,
+                                        shape.transpose_b ? shape.k : shape.n);
+    const ops::MatMul op(false, shape.transpose_b);
+
+    StorageView first(dtype, device);
+    op(a, b, first);
+    const StorageView reference = first.to_float32().to(Device::CPU);
+    for (int run = 1; run < 20; ++run) {
+      StorageView again(dtype, device);
+      op(a, b, again);
+      const StorageView got = again.to_float32().to(Device::CPU);
+      dim_t differing = 0;
+      for (dim_t i = 0; i < got.size(); ++i)
+        differing += std::memcmp(got.data<float>() + i, reference.data<float>() + i,
+                                 sizeof (float)) != 0;
+      ASSERT_EQ(differing, 0) << "run " << run << " differs from run 0";
+    }
+  }
+}
 
 TEST_P(OpDeviceTest, GemmInt8) {
   Device device = GetParam();
@@ -1707,8 +1947,11 @@ INSTANTIATE_TEST_SUITE_P(CUDA, OpDeviceFPTest,
 INSTANTIATE_TEST_SUITE_P(XPU, OpDeviceTest, ::testing::Values(Device::XPU));
 // BFLOAT16 is left out: Alchemist has no native bf16 math and mayiuse_bfloat16()
 // reports it unsupported, so there are no kernels behind it yet.
+// float32 GEMMs go through the XMX engines, which take no float32 input: each operand is
+// split into two bfloat16 halves (see xpu/gemm_xmx.h), good to a relative 1e-5 rather than
+// float32's 1e-7. At the magnitudes these tests use that lands just past 1e-5 absolute.
 INSTANTIATE_TEST_SUITE_P(XPU, OpDeviceFPTest,
-                         ::testing::Values(FloatType{Device::XPU, DataType::FLOAT32, 1e-5},
+                         ::testing::Values(FloatType{Device::XPU, DataType::FLOAT32, 1e-4},
                                            FloatType{Device::XPU, DataType::FLOAT16, 1e-2}),
                          fp_test_name);
 #endif
