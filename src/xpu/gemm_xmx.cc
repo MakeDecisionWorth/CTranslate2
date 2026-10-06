@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
+#include <type_traits>
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/bfloat16.hpp>
@@ -585,9 +587,12 @@ namespace ctranslate2 {
       template <typename Tm>
       class TiledL {
       public:
+        // With src_lo, L arrives already split (Ts is Tm): src holds the high halves and
+        // src_lo the low ones, and both are copied as they are.
         template <typename Ts>
         TiledL(const Ts* src, size_t batches, size_t stride, size_t ld, bool transpose,
-               size_t R, size_t K, size_t Rp, size_t Kp, bool split)
+               size_t R, size_t K, size_t Rp, size_t Kp, bool split,
+               const Ts* src_lo = nullptr)
           : _count(batches * Rp * Kp)
           , _split(split)
           , _buffer(_count * (split ? 2 : 1)) {
@@ -607,10 +612,16 @@ namespace ctranslate2 {
                          const size_t within = w % (TM * TK);
                          const size_t r = (tile / ktiles) * TM + within / TK;
                          const size_t k = (tile % ktiles) * TK + within % TK;
-                         float v = 0.0f;
-                         if (r < R && k < K)
-                           v = static_cast<float>(src[b * stride + (transpose ? k * ld + r
-                                                                            : r * ld + k)]);
+                         const bool inside = r < R && k < K;
+                         const size_t from = b * stride + (transpose ? k * ld + r : r * ld + k);
+                         if constexpr (std::is_same_v<Ts, Tm>) {
+                           if (src_lo) {
+                             hi[i] = inside ? src[from] : Tm(0.0f);
+                             lo[i] = inside ? src_lo[from] : Tm(0.0f);
+                             return;
+                           }
+                         }
+                         const float v = inside ? static_cast<float>(src[from]) : 0.0f;
                          const Tm high(v);
                          hi[i] = high;
                          if (lo)
@@ -635,7 +646,10 @@ namespace ctranslate2 {
                 const Ts* b, dim_t ldb, dim_t strideb,
                 float beta,
                 T* c, dim_t ldc, dim_t stridec,
-                dim_t batch_size) {
+                dim_t batch_size,
+                const Tm* pre_hi = nullptr, const Tm* pre_lo = nullptr) {
+        // pre_hi, pre_lo: B already split into its bfloat16 halves (see xmx_split_float32),
+        // laid out like B itself. Only used with B transposed, where B is L.
         const size_t M = static_cast<size_t>(m);
         const size_t N = static_cast<size_t>(n);
         Problem p;
@@ -674,8 +688,9 @@ namespace ctranslate2 {
                            transpose_a, p.K, p.Q, Kp, Qp, Split, true)
             : PackedRt<Tm>(b, p.batches, static_cast<size_t>(strideb), static_cast<size_t>(ldb),
                            true, p.K, p.Q, Kp, Qp, Split, true);
-          const TiledL<Tm> tl(l, p.batches, stride_l, ld_l, restage_transpose,
-                              p.R, p.K, Rp, Kp, Split);
+          const TiledL<Tm> tl = pre_hi
+            ? TiledL<Tm>(pre_hi, p.batches, stride_l, ld_l, false, p.R, p.K, Rp, Kp, Split, pre_lo)
+            : TiledL<Tm>(l, p.batches, stride_l, ld_l, restage_transpose, p.R, p.K, Rp, Kp, Split);
           p.ld_r = rt.ld();
           p.stride_r = rt.stride();
           p.ld_l = TK;
@@ -695,8 +710,13 @@ namespace ctranslate2 {
         p.ld_r = rt.ld();
         p.stride_r = rt.stride();
 
-        const bool stage_l = Split || restage_transpose;
-        if (stage_l && p.K > 0) {
+        // Also when L is stored in another type than the engines take, split or not.
+        const bool stage_l = Split || restage_transpose || !std::is_same_v<Ts, Tm>;
+        if (pre_hi) {
+          p.ld_l = ld_l;
+          p.stride_l = stride_l;
+          dispatch_problem<T, Tm, Split>(config, transposed, p, pre_hi, pre_lo, rt.hi(), rt.lo(), c);
+        } else if (stage_l && p.K > 0) {
           const size_t rows = restage_transpose ? p.K : p.R;
           const size_t cols = restage_transpose ? p.R : p.K;
           const StagedL<Tm> sl(l, p.batches, stride_l, rows, cols, ld_l,
@@ -733,6 +753,44 @@ namespace ctranslate2 {
                                     reinterpret_cast<const half*>(b), ldb, strideb,
                                     beta, reinterpret_cast<half*>(c), ldc, stridec,
                                     batch_size);
+    }
+
+    void xmx_split_float32(const float* src, float* dst, dim_t count) {
+      if (count <= 0)
+        return;
+      if (static_cast<const void*>(src) == static_cast<const void*>(dst))
+        throw std::invalid_argument("xmx_split_float32 cannot split in place");
+      auto* hi = reinterpret_cast<bf16*>(dst);
+      auto* lo = hi + count;
+      SYCL_CHECK(get_queue().parallel_for(
+                   ::sycl::range<1>(static_cast<size_t>(count)),
+                   [=](::sycl::id<1> id) {
+                     const size_t i = id[0];
+                     const float v = src[i];
+                     const bf16 high(v);
+                     hi[i] = high;
+                     lo[i] = bf16(v - static_cast<float>(high));
+                   }));
+    }
+
+    void xmx_gemm_packed_b(bool transpose_a, bool transpose_b,
+                           dim_t m, dim_t n, dim_t k,
+                           float alpha,
+                           const float* a, dim_t lda,
+                           const float* b, dim_t ldb,
+                           float beta,
+                           float* c, dim_t ldc) {
+      if (m <= 0 || n <= 0)
+        return;
+      if (!transpose_b)
+        throw std::invalid_argument("XMX GEMM: a packed B must be transposed, as a Dense "
+                                    "layer's weight is");
+      check_device_has_xmx();
+      const auto* hi = reinterpret_cast<const bf16*>(b);
+      const auto* lo = hi + n * ldb;
+      gemm<float, float, bf16, true>(transpose_a, transpose_b, m, n, k, alpha,
+                                     a, lda, 0, b, ldb, 0,
+                                     beta, c, ldc, 0, 1, hi, lo);
     }
 
     void xmx_gemm(bool transpose_a, bool transpose_b,

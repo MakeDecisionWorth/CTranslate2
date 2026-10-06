@@ -499,7 +499,7 @@ namespace ctranslate2 {
 
   template<>
   template<>
-  void primitives<Device::XPU>::gemm(bool, bool,
+  void primitives<Device::XPU>::gemm(bool, bool b_is_packed,
                                      bool transpose_a, bool transpose_b,
                                      dim_t m, dim_t n, dim_t k,
                                      float alpha,
@@ -508,8 +508,31 @@ namespace ctranslate2 {
                                      float beta,
                                      float* c, dim_t ldc,
                                      const float*) {
-    xpu::xmx_gemm(transpose_a, transpose_b, m, n, k, alpha,
-                  a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
+    if (b_is_packed)
+      xpu::xmx_gemm_packed_b(transpose_a, transpose_b, m, n, k, alpha,
+                             a, lda, b, ldb, beta, c, ldc);
+    else
+      xpu::xmx_gemm(transpose_a, transpose_b, m, n, k, alpha,
+                    a, lda, 0, b, ldb, 0, beta, c, ldc, 0, 1);
+  }
+
+  // float32 weights are packed by splitting them into the bfloat16 halves the XMX GEMM
+  // takes (see xmx_split_float32), which leaves them the size they were. Otherwise every
+  // call would split the whole weight again: 265 MB a decoding step for Whisper large's
+  // vocabulary projection alone.
+  template<>
+  template<>
+  dim_t primitives<Device::XPU>::gemm_pack_b(const float* b,
+                                             const bool,
+                                             const dim_t k,
+                                             const dim_t n,
+                                             const float alpha,
+                                             float* dest) {
+    if (alpha != 1)
+      return 0;  // A scale would have to be folded into the halves; nothing asks for one.
+    if (dest)
+      xpu::xmx_split_float32(b, dest, k * n);
+    return k * n * static_cast<dim_t>(sizeof (float));
   }
 
   template<>

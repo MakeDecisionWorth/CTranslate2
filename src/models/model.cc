@@ -387,8 +387,28 @@ namespace ctranslate2 {
 
     // This method runs some precomputations on linear weights when possible.
     void Model::process_linear_weights() {
+      if (_device == Device::XPU) {
+        // float32 linear weights are split once into the bfloat16 halves the XPU's XMX
+        // GEMM takes, instead of on every call (see gemm_pack_b in xpu/primitives.cc).
+        if (_effective_compute_type != ComputeType::FLOAT32)
+          return;
+        const auto variable_index = _variable_index;
+        for (const auto& pair : variable_index) {
+          const std::string& name = pair.first;
+          const StorageView& weight = *pair.second;
+          if (!is_packable(name) || weight.rank() != 2 || weight.dtype() != DataType::FLOAT32
+              || weight.device() != Device::XPU)
+            continue;
+          StorageView packed_weight = ops::Gemm::pack_b_input(weight, /*transpose=*/true,
+                                                              weight.dim(1), weight.dim(0),
+                                                              /*alpha=*/1);
+          register_variable(name + "_packed", std::move(packed_weight));
+          remove_variable(name);  // The original weight is no longer needed.
+        }
+        return;
+      }
       if (_device != Device::CPU)
-        return;  // There is currently no processing for non CPU device.
+        return;  // There is currently no processing for other devices.
 
       const bool pack_weights = cpu::pack_gemm_weights(_effective_compute_type);
       const bool transpose = true;

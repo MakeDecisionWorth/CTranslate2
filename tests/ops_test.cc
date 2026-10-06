@@ -1944,6 +1944,55 @@ INSTANTIATE_TEST_SUITE_P(CUDA, OpDeviceFPTest,
                          fp_test_name);
 #endif
 #ifdef CT2_WITH_SYCL
+// float32 Dense weights are split into bfloat16 halves once at model load
+// (gemm_pack_b) and the GEMM then reads them as they are. Covers a decoder-sized call,
+// edges, beta, and m >= 256, where the large tiling copies the pre-split weight tile-major.
+TEST(XpuGemmTest, PackedFloat32Weight) {
+  if (!xpu::has_gpu())
+    GTEST_SKIP() << "no XPU device";
+  struct Shape { dim_t m, n, k; float beta; };
+  const std::vector<Shape> shapes = {
+    {4, 1280, 1280, 0.f},
+    {37, 77, 45, 0.5f},
+    {300, 96, 64, 0.f},
+    {1, 8, 16, 1.f},
+  };
+  std::mt19937 gen(4321);
+  std::uniform_real_distribution<float> dist(-1.f, 1.f);
+  auto random_matrix = [&](dim_t rows, dim_t cols) {
+    std::vector<float> values(rows * cols);
+    for (auto& value : values)
+      value = dist(gen);
+    return StorageView({rows, cols}, values);
+  };
+  for (const auto& shape : shapes) {
+    SCOPED_TRACE(::testing::Message() << "m=" << shape.m << " n=" << shape.n
+                 << " k=" << shape.k << " beta=" << shape.beta);
+    const StorageView a = random_matrix(shape.m, shape.k);
+    const StorageView w = random_matrix(shape.n, shape.k);
+    const StorageView c = random_matrix(shape.m, shape.n);
+
+    StorageView expected(c);
+    ops::Gemm(1.f, shape.beta, false, true)(a, w, expected);
+
+    const StorageView packed = ops::Gemm::pack_b_input(w.to(Device::XPU), true,
+                                                       shape.k, shape.n, 1.f);
+    EXPECT_EQ(packed.shape(), w.shape());
+    StorageView got = c.to(Device::XPU);
+    ops::Gemm(1.f, shape.beta, false, true, false, /*b_is_packed=*/true)(
+      a.to(Device::XPU), packed, got);
+    const StorageView got_cpu = got.to(Device::CPU);
+
+    const float* g = got_cpu.data<float>();
+    const float* e = expected.data<float>();
+    dim_t mismatches = 0;
+    for (dim_t i = 0; i < expected.size(); ++i)
+      if (!(std::abs(g[i] - e[i]) <= 1e-3f + 1e-4f * std::abs(e[i])))  // NaN counts
+        ++mismatches;
+    EXPECT_EQ(mismatches, 0);
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(XPU, OpDeviceTest, ::testing::Values(Device::XPU));
 // BFLOAT16 is left out: Alchemist has no native bf16 math and mayiuse_bfloat16()
 // reports it unsupported, so there are no kernels behind it yet.

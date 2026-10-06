@@ -106,7 +106,7 @@ namespace ctranslate2 {
                           a_shift_compensation ? a_shift_compensation->data<Out>() : nullptr);
     }
 
-    template <typename T>
+    template <Device D, typename T>
     static void pack_b(const StorageView& b,
                        const bool transpose,
                        const dim_t k,
@@ -114,10 +114,10 @@ namespace ctranslate2 {
                        const float alpha,
                        StorageView& packed) {
       const T* src = b.data<T>();
-      const dim_t pack_bytes = primitives<Device::CPU>::gemm_pack_b(src,
-                                                                    transpose,
-                                                                    k, n,
-                                                                    alpha);
+      const dim_t pack_bytes = primitives<D>::gemm_pack_b(src,
+                                                          transpose,
+                                                          k, n,
+                                                          alpha);
 
       if (pack_bytes == 0)  // Packed Gemm is not supported.
         throw std::runtime_error("Packed GEMM APIs are not supported by this GEMM backend");
@@ -131,11 +131,11 @@ namespace ctranslate2 {
       packed.reserve(std::max(b_size, pack_size));
       packed.resize_as(b);
 
-      primitives<Device::CPU>::gemm_pack_b(src,
-                                           transpose,
-                                           k, n,
-                                           alpha,
-                                           packed.data<T>());
+      primitives<D>::gemm_pack_b(src,
+                                 transpose,
+                                 k, n,
+                                 alpha,
+                                 packed.data<T>());
     }
 
     StorageView Gemm::pack_b_input(const StorageView& b,
@@ -143,21 +143,31 @@ namespace ctranslate2 {
                                    const dim_t k,
                                    const dim_t n,
                                    const float alpha) {
-      if (b.device() != Device::CPU)
-        throw std::invalid_argument("Packed GEMM APIs are only defined on CPU");
-
       DataType dtype = b.dtype();
-      StorageView packed(dtype);
+      StorageView packed(dtype, b.device());
+
+#ifdef CT2_WITH_SYCL
+      // On the XPU only float32 is packed, into the bfloat16 halves its GEMM takes.
+      if (b.device() == Device::XPU) {
+        if (dtype != DataType::FLOAT32)
+          throw std::invalid_argument("Packed GEMM on the XPU device is only defined for "
+                                      "float32");
+        pack_b<Device::XPU, float>(b, transpose, k, n, alpha, packed);
+        return packed;
+      }
+#endif
+      if (b.device() != Device::CPU)
+        throw std::invalid_argument("Packed GEMM APIs are only defined on CPU and XPU");
 
       switch (dtype) {
       case DataType::FLOAT32:
-        pack_b<float>(b, transpose, k, n, alpha, packed);
+        pack_b<Device::CPU, float>(b, transpose, k, n, alpha, packed);
         break;
       case DataType::INT16:
-        pack_b<int16_t>(b, transpose, k, n, alpha, packed);
+        pack_b<Device::CPU, int16_t>(b, transpose, k, n, alpha, packed);
         break;
       case DataType::INT8:
-        pack_b<int8_t>(b, transpose, k, n, alpha, packed);
+        pack_b<Device::CPU, int8_t>(b, transpose, k, n, alpha, packed);
         break;
       default:
         throw std::invalid_argument("Cannot pack GEMM input of type " + dtype_name(dtype));
