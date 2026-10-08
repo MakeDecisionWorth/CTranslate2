@@ -39,7 +39,8 @@ namespace ctranslate2 {
       StorageView buffer2(input.dtype(), input.device());
       StorageView buffer3(input.dtype(), input.device());
       StorageView residual(input.dtype(), input.device());
-      StorageView m(static_cast<float>(0.5));
+      // In the activations' type: a float32 scalar fails a float16 Mul.
+      const StorageView m = StorageView(static_cast<float>(0.5)).to(input.dtype());
 
       _ffn1_layer_norm(input, buffer1);
       _ff1(buffer1, buffer2);
