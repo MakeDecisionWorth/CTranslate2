@@ -104,6 +104,16 @@ TEST(OpDeviceTest, GatherInPlaceLarger) {
   EXPECT_NE(data.buffer(), data_ptr);
 }
 
+// A Dense layer fed the wrong depth used to read its weight past the end - on the XPU, a
+// GPU fault and a driver reset.
+TEST(OpTest, GemmInnerDimensionMismatch) {
+  const StorageView a({2, 3}, 1.f);
+  const StorageView b({4, 5}, 1.f);
+  StorageView c;
+  ASSERT_RAISES(ops::Gemm(1, 0, false, true)(a, b, c), std::invalid_argument);
+  ASSERT_RAISES(ops::Gemm(1, 0, false, false)(a, b, c), std::invalid_argument);
+}
+
 TEST(OpTest, GemmInt16) {
   if (!mayiuse_int16(Device::CPU))
     return;

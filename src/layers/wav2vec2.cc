@@ -45,9 +45,17 @@ namespace ctranslate2 {
       ops::Add()(input, buffer2, output);
     }
 
+    // A linear weight is registered as weight_packed once it has been packed for the device
+    // (see Model::process_linear_weights), so its presence is checked under both names.
+    static const StorageView* get_linear_weight_if_exists(const models::Model& model,
+                                                          const std::string& scope) {
+      const StorageView* weight = model.get_variable_if_exists(scope + "/weight");
+      return weight ? weight : model.get_variable_if_exists(scope + "/weight_packed");
+    }
+
     Wav2Vec2Encoder::Wav2Vec2Encoder(const models::Model& model, const std::string& scope)
-      : _upgraded_model(model.get_variable_if_exists(scope + "/fp_projection/weight"))
-      , _return_logits(model.get_variable_if_exists(scope + "/lm_head/weight"))
+      : _upgraded_model(get_linear_weight_if_exists(model, scope + "/fp_projection"))
+      , _return_logits(get_linear_weight_if_exists(model, scope + "/lm_head"))
       , _transpose({0, 2, 1})
       , _num_heads(model.get_attribute_with_default<int32_t>(scope + "/num_heads", 8))
       , _layers(build_layers_list<const TransformerEncoderLayer>(model,

@@ -83,6 +83,10 @@ namespace ctranslate2 {
                        const StorageView* a_shift_compensation) const {
       const dim_t k = a.dim(_trans_a ? -2 : -1);
       const dim_t n = b.dim(_trans_b ? -2 : -1);
+      // Unchecked, a mismatch reads b past its end: garbage on the CPU, and on a GPU a fault
+      // that can take the whole device down.
+      if (b.dim(_trans_b ? -1 : -2) != k)
+        throw std::invalid_argument("Gemm: k dimension of inputs a and b should match");
       const dim_t m = a.size() / k;  // Collapse leading dimensions.
       const dim_t lda = _trans_a ? m : k;
       const dim_t ldb = _trans_b ? k : n;
