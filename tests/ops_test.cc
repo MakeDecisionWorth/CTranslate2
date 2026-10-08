@@ -7,6 +7,7 @@
 #include <thread>
 #include <set>
 #include "test_utils.h"
+#include "ctranslate2/allocator.h"
 #include "ctranslate2/layers/attention.h"
 #include "ctranslate2/ops/ops.h"
 #ifdef CT2_WITH_SYCL
@@ -1954,6 +1955,22 @@ INSTANTIATE_TEST_SUITE_P(CUDA, OpDeviceFPTest,
                          fp_test_name);
 #endif
 #ifdef CT2_WITH_SYCL
+// One allocation on the XPU holds at most 4 GiB - OpenCL's max_mem_alloc_size, and what the
+// kernels can address - so a larger tensor has to fail with an error instead of wrapping.
+// One just under the limit must still fit, although its size class may not: an A750's limit
+// is 3.88 GiB, and 3.9 GB rounds up to 4 GiB.
+TEST(XpuMemoryTest, AllocationLimit) {
+  if (!xpu::has_gpu())
+    GTEST_SKIP() << "no XPU device";
+  const size_t limit = get_allocator(Device::XPU).max_allocation_size(0);
+  EXPECT_LE(limit, size_t(4) << 30);
+  const dim_t over = static_cast<dim_t>(limit / sizeof(float)) + 1;
+  EXPECT_THROW(StorageView({over}, DataType::FLOAT32, Device::XPU), std::runtime_error);
+  const dim_t under = static_cast<dim_t>((limit - (size_t(32) << 20)) / sizeof(float));
+  const StorageView x({under}, DataType::FLOAT32, Device::XPU);
+  EXPECT_EQ(x.size(), under);
+}
+
 // float32 Dense weights are split into bfloat16 halves once at model load
 // (gemm_pack_b) and the GEMM then reads them as they are. Covers a decoder-sized call,
 // edges, beta, and m >= 256, where the large tiling copies the pre-split weight tile-major.

@@ -13,6 +13,12 @@ import ctranslate2
 Boolean environment variables can be enabled with `"1"` or `"true"`.
 ```
 
+## `CT2_ATTENTION_MAX_SCORES_BYTES`
+
+The largest attention score tensor, in bytes, that is computed in one piece. Larger ones are computed for a block of queries at a time, which gives the same result.
+
+By default there is no such limit, except on devices that cap the size of a single allocation: on the XPU it is a quarter of that cap, about 1 GiB. Setting the variable applies the limit on any device, which is mainly useful for testing.
+
 ## `CT2_CUDA_ALLOCATOR`
 
 Allocating memory on the GPU with `cudaMalloc` is costly and is best avoided in high-performance code. For this reason CTranslate2 integrates caching allocators which enable a fast reuse of previously allocated buffers. The following allocators are integrated:

@@ -1,5 +1,6 @@
 #include "ctranslate2/allocator.h"
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -65,7 +66,16 @@ namespace ctranslate2 {
         if (size == 0)
           return nullptr;
         const int index = device_index < 0 ? get_device_index() : device_index;
-        size = bin_size(size);
+        const size_t limit = max_allocation_size(index);
+        if (size > limit)
+          THROW_RUNTIME_ERROR("Cannot allocate a tensor of " + std::to_string(size)
+                              + " bytes on XPU device " + std::to_string(index)
+                              + ": one allocation on this device is limited to "
+                              + std::to_string(limit) + " bytes. Reduce the batch size or"
+                              " the input length.");
+        // A size class past the limit would turn away a tensor that fits: on an A750, 3.9 GB
+        // rounds up to 4 GiB, over its 3.88 GiB.
+        size = std::min(bin_size(size), limit);
 
         if (!no_reuse()) {
           void* recycled = nullptr;
@@ -165,6 +175,25 @@ namespace ctranslate2 {
             spdlog::error("Failed to release cached XPU memory: {}", e.what());
           }
         }
+      }
+
+      // OpenCL caps one allocation at max_mem_alloc_size: 4 GiB on an A770, 3.88 GiB on an
+      // A750. Level Zero can be told to allow more (UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS),
+      // which does not help: the kernels are compiled to address at most 4 GiB of a buffer,
+      // through 32-bit offsets, and past that a write at 4.5 GiB lands at 0.5 GiB. Compiling
+      // them with -cl-intel-greater-than-4GB-buffer-required lifts that for every kernel but
+      // made the XMX GEMM 19% slower, so large tensors are avoided instead: attention, which
+      // makes the largest ones, computes its scores in blocks (see layers/attention.cc).
+      size_t max_allocation_size(int device_index) const override {
+        static const std::vector<size_t> limits = [] {
+          std::vector<size_t> limits;
+          for (const auto& device : get_devices())
+            limits.push_back(std::min<size_t>(
+              device.get_info<::sycl::info::device::max_mem_alloc_size>(),
+              size_t(4) << 30));
+          return limits;
+        }();
+        return limits.at(device_index < 0 ? get_device_index() : device_index);
       }
 
       void clear_cache() override {

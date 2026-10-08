@@ -1,5 +1,11 @@
+#include <cstdlib>
+#include <random>
+
 #include "test_utils.h"
 #include "ctranslate2/layers/attention.h"
+#ifdef CT2_WITH_SYCL
+#  include "xpu/utils.h"
+#endif
 
 class MockModel : public models::Model {
 public:
@@ -189,3 +195,203 @@ TEST_F(CrossAttentionTest, StandardMultiHeadAttention) {
   ASSERT_EQ(cached_keys.shape(), (Shape{BATCH, NUM_HEADS, V_LEN, D_HEAD}));
   ASSERT_EQ(cached_values.shape(), cached_keys.shape());
 }
+
+// Attention computes its scores for a block of queries at a time once they would be larger
+// than CT2_ATTENTION_MAX_SCORES_BYTES. Each case runs once whole and once with one query per
+// block, and the two must agree: SoftMax normalizes every query on its own, and the masks,
+// position biases and relative positions are cut to the block's queries.
+namespace {
+
+  void set_max_scores_bytes(const char* value) {
+#ifdef _WIN32
+    _putenv_s("CT2_ATTENTION_MAX_SCORES_BYTES", value ? value : "");
+#else
+    if (value)
+      setenv("CT2_ATTENTION_MAX_SCORES_BYTES", value, 1);
+    else
+      unsetenv("CT2_ATTENTION_MAX_SCORES_BYTES");
+#endif
+  }
+
+  struct BlockedAttentionCase {
+    std::string name;
+    bool self_attention = true;
+    bool multi_query = false;
+    dim_t num_heads_kv = 4;
+    bool relative_attention_bias = false;
+    bool relative_positions = false;
+    bool asymmetric_relative_positions = false;
+    bool alibi = false;
+    bool merged = false;  // forward_merged: self keys and encoder memory in one softmax
+  };
+
+  constexpr dim_t BLOCKED_HEADS = 4;
+  constexpr dim_t BLOCKED_HEAD_DIM = 8;
+  constexpr dim_t BLOCKED_MODEL = BLOCKED_HEADS * BLOCKED_HEAD_DIM;
+
+  StorageView random_storage(std::mt19937& gen, Shape shape) {
+    std::normal_distribution<float> dist(0.f, 0.3f);
+    dim_t size = 1;
+    for (const dim_t dim : shape)
+      size *= dim;
+    std::vector<float> values(size);
+    for (auto& value : values)
+      value = dist(gen);
+    return StorageView(std::move(shape), values);
+  }
+
+  class BlockedAttentionModel : public models::Model {
+  public:
+    BlockedAttentionModel(const BlockedAttentionCase& c, ComputeType compute_type, Device device) {
+      std::mt19937 gen(1234);
+      const dim_t kv_heads = c.multi_query ? 1 : c.num_heads_kv;
+      const dim_t kv_rows = 2 * kv_heads * BLOCKED_HEAD_DIM;
+      if (c.self_attention) {
+        register_variable("attn/linear_0/weight",
+                          random_storage(gen, {BLOCKED_MODEL + kv_rows, BLOCKED_MODEL}));
+        register_variable("attn/linear_1/weight",
+                          random_storage(gen, {BLOCKED_MODEL, BLOCKED_MODEL}));
+      } else {
+        register_variable("attn/linear_0/weight",
+                          random_storage(gen, {BLOCKED_MODEL, BLOCKED_MODEL}));
+        register_variable("attn/linear_1/weight",
+                          random_storage(gen, {kv_rows, BLOCKED_MODEL}));
+        register_variable("attn/linear_2/weight",
+                          random_storage(gen, {BLOCKED_MODEL, BLOCKED_MODEL}));
+      }
+      if (c.merged)
+        register_variable("attn/memory_kv/weight", random_storage(gen, {kv_rows, BLOCKED_MODEL}));
+      if (c.multi_query)
+        register_variable("attn/multi_query", StorageView(static_cast<int8_t>(1)));
+      else if (kv_heads != BLOCKED_HEADS)
+        register_variable("attn/num_heads_kv", StorageView(static_cast<int32_t>(kv_heads)));
+      if (c.relative_attention_bias) {
+        register_variable("attn/relative_attention_bias", random_storage(gen, {32, BLOCKED_HEADS}));
+        register_variable("attn/relative_attention_max_distance",
+                          StorageView(static_cast<int32_t>(16)));
+      }
+      if (c.relative_positions) {
+        register_variable("attn/relative_position_keys",
+                          random_storage(gen, {2 * 3 + 1, BLOCKED_HEAD_DIM}));
+        register_variable("attn/relative_position_values",
+                          random_storage(gen, {2 * 3 + 1, BLOCKED_HEAD_DIM}));
+      }
+      if (c.asymmetric_relative_positions) {
+        register_variable("attn/relative_asymmetric_position_keys",
+                          random_storage(gen, {4 + 2 + 1, BLOCKED_HEAD_DIM}));
+        register_variable("attn/relative_left_max_position", StorageView(static_cast<int32_t>(4)));
+        register_variable("attn/relative_right_max_position", StorageView(static_cast<int32_t>(2)));
+      }
+      set_compute_type(compute_type, device, 0);
+    }
+
+  protected:
+    std::unique_ptr<Model> clone() const override { return nullptr; }
+  };
+
+}
+
+class BlockedAttentionTest : public ::testing::TestWithParam<FloatType> {
+};
+
+TEST_P(BlockedAttentionTest, BlocksMatchWhole) {
+  const Device device = GetParam().device;
+  const DataType dtype = GetParam().dtype;
+  const float error = GetParam().error;
+#ifdef CT2_WITH_SYCL
+  if (device == Device::XPU && !xpu::has_gpu())
+    GTEST_SKIP() << "no XPU device";
+#endif
+
+  std::vector<BlockedAttentionCase> cases(10);
+  cases[0].name = "self";
+  cases[1].name = "cross";
+  cases[1].self_attention = false;
+  cases[2].name = "relative_attention_bias";
+  cases[2].relative_attention_bias = true;
+  cases[3].name = "relative_positions";
+  cases[3].relative_positions = true;
+  cases[4].name = "asymmetric_relative_positions";
+  cases[4].asymmetric_relative_positions = true;
+  cases[5].name = "alibi";
+  cases[5].alibi = true;
+  cases[6].name = "multi_query";  // time and head dimensions merged
+  cases[6].multi_query = true;
+  cases[7].name = "grouped_query";
+  cases[7].num_heads_kv = 2;
+  cases[8].name = "cross_multi_query";
+  cases[8].self_attention = false;
+  cases[8].multi_query = true;
+  cases[9].name = "merged";
+  cases[9].merged = true;
+  cases[9].num_heads_kv = 2;
+
+  constexpr dim_t batch = 2;
+  constexpr dim_t num_queries = 7;
+  constexpr dim_t num_memory = 9;
+  const ComputeType compute_type = dtype == DataType::FLOAT16
+    ? ComputeType::FLOAT16
+    : ComputeType::FLOAT32;
+
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.name);
+    BlockedAttentionModel model(c, compute_type, device);
+    model.set_device(device, 0);
+    std::unique_ptr<layers::Alibi> alibi;
+    if (c.alibi)
+      alibi = std::make_unique<layers::Alibi>();
+    const layers::MultiHeadAttention attention(model, "attn", BLOCKED_HEADS, c.self_attention,
+                                               /*pre_norm=*/true, /*is_decoder=*/false,
+                                               alibi.get());
+
+    std::mt19937 gen(42);
+    const StorageView queries =
+      random_storage(gen, {batch, num_queries, BLOCKED_MODEL}).to(dtype).to(device);
+    const StorageView memory =
+      random_storage(gen, {batch, num_memory, BLOCKED_MODEL}).to(dtype).to(device);
+
+    const auto mask = [&](const std::vector<int32_t>& lengths, bool mask_future, bool multi_query) {
+      return layers::AttentionLayer::prepare_length_mask(
+        StorageView({batch}, lengths, device), BLOCKED_HEADS, num_queries, mask_future, multi_query);
+    };
+
+    const auto run = [&](const char* max_scores_bytes, StorageView& output, StorageView& weights) {
+      set_max_scores_bytes(max_scores_bytes);
+      if (c.merged) {
+        const StorageView self_mask = mask({num_queries, num_queries - 2}, true, false);
+        const StorageView memory_mask = mask({num_memory, num_memory - 4}, false, false);
+        StorageView self_keys(dtype, device), self_values(dtype, device);
+        StorageView memory_keys(dtype, device), memory_values(dtype, device);
+        attention.forward_merged(queries, &memory, &memory_mask, &self_mask, output,
+                                 &self_keys, &self_values, &memory_keys, &memory_values,
+                                 nullptr, nullptr, /*offset=*/0);
+      } else if (c.self_attention) {
+        const StorageView lengths_mask = mask({num_queries, num_queries - 2}, true, c.multi_query);
+        attention(queries, queries, &lengths_mask, output, nullptr, nullptr, &weights);
+      } else {
+        const StorageView lengths_mask = mask({num_memory, num_memory - 4}, false, false);
+        attention(queries, memory, &lengths_mask, output, nullptr, nullptr, &weights);
+      }
+      set_max_scores_bytes(nullptr);
+    };
+
+    StorageView whole_output(dtype, device), whole_weights(dtype, device);
+    StorageView blocked_output(dtype, device), blocked_weights(dtype, device);
+    run(nullptr, whole_output, whole_weights);
+    run("1", blocked_output, blocked_weights);
+
+    expect_storage_eq(blocked_output.to_float32(), whole_output.to_float32(), error);
+    if (!c.merged)
+      expect_storage_eq(blocked_weights.to_float32(), whole_weights.to_float32(), error);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(CPU, BlockedAttentionTest,
+                         ::testing::Values(FloatType{Device::CPU, DataType::FLOAT32, 1e-5f}),
+                         fp_test_name);
+#ifdef CT2_WITH_SYCL
+INSTANTIATE_TEST_SUITE_P(XPU, BlockedAttentionTest,
+                         ::testing::Values(FloatType{Device::XPU, DataType::FLOAT32, 1e-4f},
+                                           FloatType{Device::XPU, DataType::FLOAT16, 1e-2f}),
+                         fp_test_name);
+#endif

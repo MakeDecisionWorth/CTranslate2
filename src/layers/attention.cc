@@ -1,13 +1,18 @@
 #include "ctranslate2/layers/attention.h"
+#include "ctranslate2/allocator.h"
 #include "ctranslate2/ops/split.h"
 #include "ctranslate2/utils.h"
 
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
+#include <string>
+#include <vector>
 
 #include "dispatch.h"
+#include "env.h"
 #include "cpu/parallel.h"
 
 namespace ctranslate2 {
@@ -175,6 +180,28 @@ namespace ctranslate2 {
       }
     }
 
+    // The attention scores have one value per query and key, for every batch entry and head,
+    // which makes them the largest tensor attention creates: 4.3 GB for Whisper large's
+    // encoder at batch 24 in float32. A device can limit what one allocation holds (the XPU
+    // to 4 GiB, see xpu/allocator.cc), and the scores are then computed for a block of
+    // queries at a time. SoftMax normalizes each query on its own and everything else is per
+    // query too, so the blocks give the same result as the whole.
+    //
+    // CT2_ATTENTION_MAX_SCORES_BYTES sets the size on any device, which makes the blocked path
+    // testable with small inputs.
+    static size_t max_attention_scores_bytes(Device device, int device_index) {
+      const std::string value = read_string_from_env("CT2_ATTENTION_MAX_SCORES_BYTES");
+      if (!value.empty())
+        return std::stoull(value);
+      const size_t limit = get_allocator(device).max_allocation_size(device_index);
+      if (limit == std::numeric_limits<size_t>::max())
+        return limit;
+      // A quarter of the limit rather than all of it: on the XPU the float32 GEMM also makes a
+      // split copy of the scores as large as the scores, and Whisper at batch 24 in float32
+      // otherwise needs 8.6 GB for those two alone.
+      return limit / 4;
+    }
+
     static void dot_product_attention(const StorageView& queries,
                                       const StorageView& keys,
                                       const StorageView& values,
@@ -196,6 +223,8 @@ namespace ctranslate2 {
                                       Alibi* alibi = nullptr,
                                       StorageView* position_bias = nullptr) {
       PROFILE("dot_product_attention");
+      const Device device = queries.device();
+      const DataType dtype = queries.dtype();
 
       std::unique_ptr<const StorageView> relative_positions;
       if (relative_position_keys || relative_position_values || relative_asymmetric_position_keys) {
@@ -213,24 +242,11 @@ namespace ctranslate2 {
                                        maximum_relative_position).to(queries.device()));
       }
 
-      const ops::MatMul keys_matmul(/*trans_a=*/false, /*trans_b=*/true, queries_scale);
-      keys_matmul(queries, keys, output);
-      if (relative_position_keys)
-        add_relative_representations(queries,
-                                     *relative_positions,
-                                     *relative_position_keys,
-                                     keys_matmul,
-                                     output);
-
-      if (relative_asymmetric_position_keys)
-        add_relative_representations(queries,
-                                     *relative_positions,
-                                     *relative_asymmetric_position_keys,
-                                     keys_matmul,
-                                     output);
+      // The bias is [heads, queries, keys] and broadcast over the batch.
+      const StorageView* bias = nullptr;
+      StorageView local_position_bias(dtype, device);
+      StorageView position_bias_tmp(dtype, device);
       if (relative_attention_bias) {
-        StorageView local_position_bias(output.dtype(), output.device());
-
         if (!position_bias)
           position_bias = &local_position_bias;
 
@@ -244,46 +260,143 @@ namespace ctranslate2 {
                                                  is_decoder,
                                                  with_cache ? key_length - 1 : 0);
         }
-        StorageView* position_bias_per_gpu = position_bias;
-        StorageView position_bias_tmp(position_bias->dtype(), position_bias->device());
+        bias = position_bias;
         if (ScopedMPISetter::getCurRank() != 0) {
           const dim_t num_head_per_gpu = SAFE_DIVIDE(position_bias->dim(0), ScopedMPISetter::getNRanks());
           ops::Slide slide_ops(0, num_head_per_gpu * ScopedMPISetter::getCurRank(),
                                num_head_per_gpu, true);
           slide_ops(*position_bias, position_bias_tmp);
-          position_bias_per_gpu = &position_bias_tmp;
+          bias = &position_bias_tmp;
+        }
+      }
+
+      const ops::MatMul keys_matmul(/*trans_a=*/false, /*trans_b=*/true, queries_scale);
+      const ops::MatMul values_matmul;
+
+      // Attention for the queries in `q`, which may be a block of all of them; `lengths`,
+      // `positions` and `q_bias` are cut to the same queries.
+      const auto attend = [&](const StorageView& q,
+                              const StorageView* lengths,
+                              const StorageView* positions,
+                              const StorageView* q_bias,
+                              StorageView& context,
+                              StorageView* weights) {
+        StorageView scores(dtype, device);
+        keys_matmul(q, keys, scores);
+        if (relative_position_keys)
+          add_relative_representations(q, *positions, *relative_position_keys, keys_matmul, scores);
+        if (relative_asymmetric_position_keys)
+          add_relative_representations(q,
+                                       *positions,
+                                       *relative_asymmetric_position_keys,
+                                       keys_matmul,
+                                       scores);
+        if (q_bias)
+          DEVICE_AND_TYPE_DISPATCH(device, dtype,
+                                   primitives<D>::add_batch_broadcast(q_bias->data<T>(),
+                                                                      scores.data<T>(),
+                                                                      q_bias->size(),
+                                                                      scores.size()));
+        if (alibi)
+          alibi->apply(scores, queries_scale);
+
+        StorageView attn(dtype, device);
+        if (weights && !return_normalized_attention) {
+          ops::SoftMax()(scores, lengths, attn);
+          *weights = std::move(scores);
+        } else {
+          attn = std::move(scores);
+          ops::SoftMax()(attn, lengths, attn);
         }
 
-        DEVICE_AND_TYPE_DISPATCH(output.device(), output.dtype(),
-                                 primitives<D>::add_batch_broadcast(position_bias_per_gpu->data<T>(),
-                                                                    output.data<T>(),
-                                                                    position_bias_per_gpu->size(),
-                                                                    output.size()));
+        values_matmul(attn, values, context);
+        if (relative_position_values)
+          add_relative_representations(attn, *positions, *relative_position_values, values_matmul, context);
+
+        if (weights && return_normalized_attention)
+          *weights = std::move(attn);
+      };
+
+      // Queries are [batch, heads, queries, depth], or [batch, queries * heads, depth] when the
+      // time and head dimensions are merged; either way each query position spans `entries`
+      // rows of the scores.
+      const dim_t query_axis = queries.rank() - 2;
+      const dim_t num_queries = queries.dim(query_axis);
+      const dim_t num_keys = keys.dim(-2);
+      const dim_t entries = queries.size() / std::max<dim_t>(num_queries * queries.dim(-1), 1);
+      const size_t bytes_per_query = size_t(entries) * size_t(num_keys) * size_t(queries.item_size());
+      const size_t max_bytes = max_attention_scores_bytes(device, queries.device_index());
+      const dim_t max_block = bytes_per_query == 0
+        ? num_queries
+        : dim_t(std::min<size_t>(std::max<size_t>(max_bytes / bytes_per_query, 1), num_queries));
+
+      StorageView weights(dtype, device);
+      if (max_block >= num_queries) {
+        attend(queries, values_lengths, relative_positions.get(), bias, output,
+               attention ? &weights : nullptr);
+        if (attention)
+          save_attention(*attention, std::move(weights), beam_size);
+        return;
       }
 
-      if (alibi)
-        alibi->apply(output, queries_scale);
+      // Blocks of equal size, so that the last one is not a sliver.
+      const dim_t num_blocks = (num_queries + max_block - 1) / max_block;
+      const dim_t block_size = (num_queries + num_blocks - 1) / num_blocks;
 
-      StorageView attn(values.dtype(), values.device());
-      if (attention && !return_normalized_attention) {
-        ops::SoftMax()(output, values_lengths, attn);
-        save_attention(*attention, std::move(output), beam_size);
-      } else {
-        attn = std::move(output);
-        ops::SoftMax()(attn, values_lengths, attn);
+      // The lengths hold one value per row of the scores, viewed here as [entries, queries].
+      StorageView lengths(DataType::INT32, device);
+      if (values_lengths) {
+        lengths = *values_lengths;
+        lengths.reshape({entries, num_queries});
       }
 
-      const ops::MatMul values_matmul;
-      values_matmul(attn, values, output);
-      if (relative_position_values)
-        add_relative_representations(attn,
-                                     *relative_positions,
-                                     *relative_position_values,
-                                     values_matmul,
-                                     output);
+      std::vector<StorageView> contexts;
+      std::vector<StorageView> weights_blocks;
+      contexts.reserve(num_blocks);
+      weights_blocks.reserve(num_blocks);
+      for (dim_t start = 0; start < num_queries; start += block_size) {
+        const dim_t size = std::min(block_size, num_queries - start);
 
-      if (attention && return_normalized_attention)
-        save_attention(*attention, std::move(attn), beam_size);
+        StorageView q_block(dtype, device);
+        ops::Slide(query_axis, start, size)(queries, q_block);
+        StorageView lengths_block(DataType::INT32, device);
+        if (values_lengths)
+          ops::Slide(1, start, size)(lengths, lengths_block);
+        StorageView positions_block(DataType::INT32, device);
+        if (relative_positions)
+          ops::Slide(0, start, size)(*relative_positions, positions_block);
+        StorageView bias_block(dtype, device);
+        if (bias)
+          ops::Slide(1, start, size)(*bias, bias_block);
+
+        contexts.emplace_back(dtype, device);
+        StorageView* block_weights = nullptr;
+        if (attention) {
+          weights_blocks.emplace_back(dtype, device);
+          block_weights = &weights_blocks.back();
+        }
+
+        attend(q_block,
+               values_lengths ? &lengths_block : nullptr,
+               relative_positions ? &positions_block : nullptr,
+               bias ? &bias_block : nullptr,
+               contexts.back(),
+               block_weights);
+      }
+
+      const ops::Concat concat_op(query_axis);
+      std::vector<const StorageView*> parts;
+      for (const auto& context : contexts)
+        parts.push_back(&context);
+      concat_op(parts, output);
+
+      if (attention) {
+        parts.clear();
+        for (const auto& block_weights : weights_blocks)
+          parts.push_back(&block_weights);
+        concat_op(parts, weights);
+        save_attention(*attention, std::move(weights), beam_size);
+      }
     }
 
 
@@ -781,12 +894,21 @@ namespace ctranslate2 {
       }
 
       StorageView context(dtype, device);
-      const ops::MatMul keys_matmul(false, true, _queries_scale);
-      keys_matmul(queries_proj, merged_keys, context);
-      StorageView attn(dtype, device);
-      ops::SoftMax()(context, merged_lengths.get(), attn);
-      const ops::MatMul values_matmul;
-      values_matmul(attn, merged_values, context);
+      dot_product_attention(queries_proj,
+                            merged_keys,
+                            merged_values,
+                            merged_lengths.get(),
+                            /*relative_position_keys=*/nullptr,
+                            /*relative_asymmetric_position_keys=*/nullptr,
+                            /*relative_position_values=*/nullptr,
+                            /*relative_attention_bias=*/nullptr,
+                            /*relative_left_max_position=*/0,
+                            /*relative_right_max_position=*/0,
+                            /*maximum_relative_position=*/0,
+                            context,
+                            /*attention=*/nullptr,
+                            /*return_normalized_attention=*/true,
+                            _queries_scale);
 
       combine_heads(context, _num_heads, queries_padder, /*beam_size=*/1);
       _linear.back()(context, output, _layer_norm ? &queries : nullptr);
